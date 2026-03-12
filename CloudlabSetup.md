@@ -17,14 +17,14 @@ For MAC / Unix:
 4. `ssh-add ~/.ssh/<ssh_key_file>`, verify with `ssh-add -l`
 5. Add `~/.ssh/<ssh_key_file>.pub` to CloudLab profile
 
-# Everytime Experiment Setup
+# Homa Install
+Needs to be done everytime you start a experiment
 ## 1. SSH into Node0 (sender)
 1. Go to **Experiments** in Cloudlab and select the experiment
 2. You should be able to click the ssh for each node, open in terminal, and be connected.
 
 ## 2. Enable node-to-node SSH
-1. SSH into node 0 and run the commands below from there
-2. ```
+1. ```
     sudo apt install -y openssh-client
 
     ssh-keygen -t ed25519
@@ -34,7 +34,7 @@ For MAC / Unix:
     sudo ssh node$i "mkdir -p /users/<Cloudlab Username>/.ssh && echo '$KEY' >> /users/<Cloudlab Username>/.ssh/authorized_keys"
     done
     ```
-3. Veryify:
+2. Veryify:
     ```
     for i in {0..9}; do
         ssh node$i hostname
@@ -60,7 +60,7 @@ For MAC / Unix:
     done
     ```
 
-# 3. Install build tools
+## 3. Install build tools
 From node 0:
 
 1. 
@@ -76,12 +76,12 @@ From node 0:
     done
     ```
 
-# 4.
-1. Install Homa: `git clone https://github.com/PlatformLab/HomaModule.git`
+## 4.
+1. Install Homa: `git clone git clone -b linux_5.4.80 --single-branch git@github.com:XanderYoon/HomaModule.git`
 2. 
     ```
     for i in {1..9}; do
     scp -r HomaModule node$i:~
     done
     ```
-3. 
+3.  `cd ~/HomaModule/util && make &&

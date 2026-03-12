@@ -75,6 +75,7 @@ std::string protocol_string;
 const char *protocol;
 int server_nodes = 1;
 int server_ports = 1;
+std::string server_name_format = "node%d";
 bool verbose = false;
 std::string workload_string;
 const char *workload = "100";
@@ -265,7 +266,8 @@ void print_help(const char *name)
 		"                      client machine (divided equally among client ports)\n"
 		"                      (default: %d)\n"
 		"    --first-port      Lowest port number to use for each server (default: %d)\n"
-		"    --first-server    Id of first server node (default: %d, meaning node-%d)\n"
+		"    --first-server    Id of first server node (default: %d, meaning "
+		"server-name-format applied to %d)\n"
 		"    --gbps            Target network utilization, including only message data,\n"
 		"                      Gbps; 0 means send continuously (default: %.1f)\n"
 		"    --id              Id of this node; a value of I >= 0 means requests will\n"
@@ -277,6 +279,8 @@ void print_help(const char *name)
 		"    --port-receivers  Number of threads to listen for responses on each\n"
 		"                      port (default: %d)\n"
 		"    --protocol        Transport protocol to use: homa or tcp (default: %s)\n"
+		"    --server-name-format printf-style hostname pattern for server nodes;\n"
+		"                      must include %%d for the node id (default: %s)\n"
 		"    --server-nodes    Number of nodes running server threads (default: %d)\n"
 		"    --server-ports    Number of server ports on each server node\n"
 		"                      (default: %d)\n"
@@ -310,7 +314,7 @@ void print_help(const char *name)
 		"     kfreeze          Freeze the kernel's internal timetrace\n"
 		"     print file       Dump timetrace information to file\n",
 		client_max, first_port, first_server, first_server, net_gbps,
-		client_ports, port_receivers, protocol,
+		client_ports, port_receivers, protocol, server_name_format.c_str(),
 		server_nodes, server_ports, workload,
 		first_port, protocol, port_threads, server_ports);
 }
@@ -481,7 +485,7 @@ void init_server_addrs(void)
 
 		if (node == id)
 			continue;
-		snprintf(host, sizeof(host), "node-%d", node);
+		snprintf(host, sizeof(host), server_name_format.c_str(), node);
 		memset(&hints, 0, sizeof(struct addrinfo));
 		hints.ai_family = AF_INET;
 		hints.ai_socktype = SOCK_DGRAM;
@@ -2689,6 +2693,13 @@ int client_cmd(std::vector<string> &words)
 		} else if (strcmp(option, "--server-nodes") == 0) {
 			if (!parse(words, i+1, &server_nodes, option, "integer"))
 				return 0;
+			i++;
+		} else if (strcmp(option, "--server-name-format") == 0) {
+			if ((i + 1) >= words.size()) {
+				printf("No value provided for %s\n", option);
+				return 0;
+			}
+			server_name_format = words[i+1];
 			i++;
 		} else if (strcmp(option, "--server-ports") == 0) {
 			if (!parse(words, i+1, &server_ports, option, "integer"))
