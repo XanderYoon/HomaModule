@@ -128,8 +128,10 @@ struct inet_protosw homa_protosw = {
 
 /* This structure is used by IP to deliver incoming Homa packets to us. */
 static struct net_protocol homa_protocol = {
-	.early_demux =	NULL, /*homa_v4_early_demux */
-	.early_demux_handler =	NULL, /* homa_v4_early_demux_handler */
+	/* Disabled for Ubuntu 20.04's 5.4.0-212 kernel headers:
+	 * .early_demux = NULL,
+	 * .early_demux_handler = NULL,
+	 */
 	.handler =	homa_softirq,
 	.err_handler =	homa_err_handler,
 	.no_policy =	1,
