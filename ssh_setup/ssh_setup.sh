@@ -8,8 +8,8 @@ HOSTS_FILE="$SCRIPT_DIR/hosts.txt"
 SSH_DIR="$HOME/.ssh"
 CONFIG_DIR="$SSH_DIR/config.d"
 LOCAL_CONFIG_FILE="$CONFIG_DIR/cloudlab"
-REPO_URL="${HOMA_REPO_URL:-https://github.com/XanderYoon/homaModule.git}"
-REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-\$HOME/homaModule}"
+REPO_URL="${HOMA_REPO_URL:-https://github.com/XanderYoon/HomaModule.git}"
+REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-\$HOME/HomaModule}"
 NODE0_ALIAS="node0"
 
 log() {
