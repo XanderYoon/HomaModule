@@ -149,48 +149,40 @@ setup_homa_on_node0() {
     ssh "$NODE0_ALIAS" '
         set -euo pipefail
         sudo apt-get update
-        sudo apt-get install -y git make gcc g++ openssh-client ethtool python3 "linux-headers-$(uname -r)"
+        sudo apt-get install -y git make gcc g++ openssh-client ethtool python3
     '
 
     log "node0-homa" "Cloning or updating Homa repo on node0"
     ssh "$NODE0_ALIAS" "
         set -euo pipefail
-        cd ~
-        rm -rf -- *
-        git clone --branch $REPO_BRANCH $REPO_URL $REMOTE_REPO_DIR
+        if [[ -d $REMOTE_REPO_DIR/.git ]]; then
+            git -C $REMOTE_REPO_DIR fetch origin $REPO_BRANCH
+            git -C $REMOTE_REPO_DIR checkout $REPO_BRANCH
+            git -C $REMOTE_REPO_DIR reset --hard origin/$REPO_BRANCH
+        else
+            rm -rf -- $REMOTE_REPO_DIR
+            git clone --branch $REPO_BRANCH $REPO_URL $REMOTE_REPO_DIR
+        fi
     "
 
-    log "node0-homa" "Building Homa kernel module and utilities on node0"
+    log "node0-homa" "Building Homa utilities on node0"
     ssh "$NODE0_ALIAS" "
         set -euo pipefail
-        make -C $REMOTE_REPO_DIR clean
-        make -C $REMOTE_REPO_DIR
-        make -C $REMOTE_REPO_DIR/util clean
-        make -C $REMOTE_REPO_DIR/util
+        cd $REMOTE_REPO_DIR/util
+        make clean
+        make
         mkdir -p ~/bin
         install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
         install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
     "
-
-    log "node0-homa" "Loading Homa on node0"
-    ssh "$NODE0_ALIAS" "
-        set -euo pipefail
-        sudo rmmod homa >/dev/null 2>&1 || true
-        sudo insmod $REMOTE_REPO_DIR/homa.ko
-        sudo sysctl net.homa.link_mbps=25000
-        sudo sysctl net.homa.num_priorities=8
-    "
 }
 
 verify_homa_on_node0() {
-    log "node0-homa" "Verifying Homa artifacts on node0"
+    log "node0-homa" "Verifying Homa utilities on node0"
     ssh "$NODE0_ALIAS" "
         set -euo pipefail
-        test -f $REMOTE_REPO_DIR/homa.ko
         test -x $REMOTE_REPO_DIR/util/cp_node
         test -x $REMOTE_REPO_DIR/util/homa_prio
-        lsmod | grep '^homa '
-        test -r /proc/net/homa_metrics
         printf 'Remote repo: %s\n' $REMOTE_REPO_DIR
         printf 'cp_node: %s\n' $REMOTE_REPO_DIR/util/cp_node
         printf 'homa_prio: %s\n' $REMOTE_REPO_DIR/util/homa_prio
@@ -214,7 +206,7 @@ main() {
     setup_homa_on_node0
     verify_homa_on_node0
 
-    log "done" "SSH bootstrap complete and Homa is built and loaded on node0"
+    log "done" "SSH bootstrap complete and Homa utilities are built on node0"
 }
 
 main "$@"
