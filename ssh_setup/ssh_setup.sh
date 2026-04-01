@@ -53,7 +53,7 @@ EOF
 
     for i in "${!HOSTS[@]}"; do
         cat >>"$LOCAL_CONFIG_FILE" <<EOF
-Host node$i cloudlab-node$i
+Host node$i node-$i cloudlab-node$i cloudlab-node-$i
     HostName ${HOSTS[$i]}
     User $REMOTE_USER
     StrictHostKeyChecking no
@@ -99,7 +99,7 @@ EOF
 
     for i in "${!HOSTS[@]}"; do
         ssh "$NODE0_ALIAS" "cat >> ~/.ssh/config.d/cloudlab" <<EOF
-Host node$i cloudlab-node$i
+Host node$i node-$i cloudlab-node$i cloudlab-node-$i
     HostName ${HOSTS[$i]}
     User $REMOTE_USER
     StrictHostKeyChecking no
@@ -189,6 +189,32 @@ verify_homa_on_node0() {
     "
 }
 
+enable_dctcp_and_tfo() {
+    for i in "${!HOSTS[@]}"; do
+        log "tcp-tuning" "Enabling DCTCP and TCP Fast Open on node$i"
+        ssh "node$i" '
+            set -euo pipefail
+            sudo modprobe tcp_dctcp || true
+            sudo sysctl -w net.ipv4.tcp_ecn=1
+            sudo sysctl -w net.ipv4.tcp_congestion_control=dctcp
+            sudo sysctl -w net.ipv4.tcp_fastopen=3
+        '
+    done
+}
+
+verify_dctcp_and_tfo() {
+    for i in "${!HOSTS[@]}"; do
+        log "tcp-verify" "Verifying DCTCP and TCP Fast Open on node$i"
+        ssh "node$i" '
+            set -euo pipefail
+            printf "tcp_ecn=%s\n" "$(sysctl -n net.ipv4.tcp_ecn)"
+            printf "tcp_congestion_control=%s\n" \
+                "$(sysctl -n net.ipv4.tcp_congestion_control)"
+            printf "tcp_fastopen=%s\n" "$(sysctl -n net.ipv4.tcp_fastopen)"
+        '
+    done
+}
+
 main() {
     require_cmd ssh
     require_cmd ssh-copy-id
@@ -205,8 +231,10 @@ main() {
     verify_node0_connectivity
     setup_homa_on_node0
     verify_homa_on_node0
+    enable_dctcp_and_tfo
+    verify_dctcp_and_tfo
 
-    log "done" "SSH bootstrap complete and Homa utilities are built on node0"
+    log "done" "SSH bootstrap complete, Homa utilities are built on node0, and TCP tuning is enabled"
 }
 
 main "$@"

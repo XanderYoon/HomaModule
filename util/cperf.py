@@ -41,6 +41,9 @@ matplotlib.rcParams['ps.fonttype'] = 42
 if platform.system() != "Windows":
     import fcntl
 
+SSH_OPTIONS = ["-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR",
+        "-o", "UserKnownHostsFile=/dev/null"]
+
 # If a server's id appears as a key in this dictionary, it means we
 # have started cp_node running on that node. The value of each entry is
 # a Popen object that can be used to communicate with the node.
@@ -354,6 +357,24 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
                 if print_data != "":
                     log("output from node-%d: '%s'" % (id, print_data))
                 outputs[id] += data
+            status = active_nodes[id].poll()
+            if status != None:
+                data = active_nodes[id].stdout.read()
+                if data:
+                    outputs[id] += data
+                detail = ("node-%d exited with status %d after command '%s'"
+                        % (id, status, cmd))
+                if outputs[id]:
+                    raise Exception("%s: output was '%s'" % (detail,
+                            outputs[id]))
+                log_tail = subprocess.run(["ssh"] + SSH_OPTIONS +
+                        ["node-%d" % (id), "tail", "-n", "40", "node.log"],
+                        capture_output=True, encoding="utf-8")
+                if log_tail.returncode == 0 and log_tail.stdout.rstrip():
+                    raise Exception("%s; tail of node.log:\n%s" % (detail,
+                            log_tail.stdout.rstrip()))
+                raise Exception("%s: process terminated without output"
+                        % (detail))
         bad_node = -1
         for id in nodes:
             if not string in outputs[id]:
@@ -385,8 +406,8 @@ def start_nodes(r, options):
         if id in active_nodes:
             continue
         vlog("Starting cp_node on node-%d" % (id))
-        node = subprocess.Popen(["ssh", "-o", "StrictHostKeyChecking=no",
-                "node-%d" % (id), "cp_node"], encoding="utf-8",
+        node = subprocess.Popen(["ssh"] + SSH_OPTIONS + ["node-%d" % (id),
+                "cp_node"], encoding="utf-8",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT)
         fl = fcntl.fcntl(node.stdin, fcntl.F_GETFL)
@@ -396,9 +417,9 @@ def start_nodes(r, options):
         active_nodes[id] = node
         if not options.no_homa_prio:
             f = open("%s/homa_prio-%d.log" % (log_dir,id), "w")
-            homa_prios[id] = subprocess.Popen(["ssh", "-o",
-                    "StrictHostKeyChecking=no", "node-%d" % (id), "sudo",
-                    "bin/homa_prio", "--interval", "500", "--unsched",
+            homa_prios[id] = subprocess.Popen(["ssh"] + SSH_OPTIONS +
+                    ["node-%d" % (id), "sudo", "bin/homa_prio",
+                    "--interval", "500", "--unsched",
                     str(options.unsched), "--unsched-boost",
                     str(options.unsched_boost)], encoding="utf-8",
                     stdout=f, stderr=subprocess.STDOUT)
@@ -420,8 +441,8 @@ def stop_nodes():
     """
     global active_nodes, server_nodes
     for id, popen in homa_prios.items():
-        subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no",
-                "node-%d" % id, "sudo", "pkill", "homa_prio"])
+        subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id, "sudo",
+                "pkill", "homa_prio"])
         try:
             popen.wait(5.0)
         except subprocess.TimeoutExpired:
@@ -476,7 +497,7 @@ def do_ssh(command, nodes):
     """
     vlog("ssh command on nodes %s: %s" % (str(nodes), " ".join(command)))
     for id in nodes:
-        subprocess.run(["ssh", "node-%d" % id] + command,
+        subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id] + command,
                 stdout=subprocess.DEVNULL)
 
 def get_sysctl_parameter(name):
@@ -505,7 +526,7 @@ def set_sysctl_parameter(name, value, nodes):
     vlog("Setting Homa parameter %s to %s on nodes %s" % (name, value,
             str(nodes)))
     for id in nodes:
-        subprocess.run(["ssh", "node-%d" % id, "sudo", "sysctl",
+        subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id, "sudo", "sysctl",
                 "%s=%s" % (name, value)], stdout=subprocess.DEVNULL)
 
 def start_servers(r, options):
@@ -620,7 +641,8 @@ def run_experiment(name, clients, options):
             time.sleep(2)
             vlog("Recording initial metrics")
             for id in active_nodes:
-                subprocess.run(["ssh", "node-%d" % (id), "metrics.py"],
+                subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % (id),
+                        "metrics.py"],
                         stdout=subprocess.DEVNULL)
         if not "no_rtt_files" in options:
             do_cmd("dump_times /dev/null", clients)
@@ -641,7 +663,8 @@ def run_experiment(name, clients, options):
         vlog("Recording final metrics")
         for id in active_nodes:
             f = open("%s/%s-%d.metrics" % (options.log_dir, name, id), 'w')
-            subprocess.run(["ssh", "node-%d" % (id), "metrics.py"], stdout=f);
+            subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % (id),
+                    "metrics.py"], stdout=f);
             f.close()
         shutil.copyfile("%s/%s-%d.metrics" % (options.log_dir, name, first_server),
                 "%s/reports/%s.metrics" % (options.log_dir, name))
