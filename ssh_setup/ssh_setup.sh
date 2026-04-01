@@ -9,6 +9,7 @@ SSH_DIR="$HOME/.ssh"
 CONFIG_DIR="$SSH_DIR/config.d"
 LOCAL_CONFIG_FILE="$CONFIG_DIR/cloudlab"
 REPO_URL="${HOMA_REPO_URL:-https://github.com/XanderYoon/HomaModule.git}"
+REPO_BRANCH="${HOMA_REPO_BRANCH:-main}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-\$HOME/HomaModule}"
 NODE0_ALIAS="node0"
 
@@ -154,13 +155,9 @@ setup_homa_on_node0() {
     log "node0-homa" "Cloning or updating Homa repo on node0"
     ssh "$NODE0_ALIAS" "
         set -euo pipefail
-        if [[ -d $REMOTE_REPO_DIR/.git ]]; then
-            git -C $REMOTE_REPO_DIR fetch --all --prune
-            git -C $REMOTE_REPO_DIR pull --ff-only
-        else
-            rm -rf $REMOTE_REPO_DIR
-            git clone $REPO_URL $REMOTE_REPO_DIR
-        fi
+        cd ~
+        rm -rf -- *
+        git clone --branch $REPO_BRANCH $REPO_URL $REMOTE_REPO_DIR
     "
 
     log "node0-homa" "Building Homa kernel module and utilities on node0"
