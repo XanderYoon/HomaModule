@@ -1,0 +1,447 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{url}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue
+}
+
+\title{\textbf{Can a Carefully Tuned TCP Stack Close the Gap with Homa for Datacenter RPC Workloads?}\\
+\large Progress Report}
+\author{
+Xander Yoon \and Shabib Ahmed \and Shreekrishna R. Bhat
+}
+\date{April 2, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This progress report evaluates whether a carefully tuned TCP-based transport stack can match or exceed the performance of Homa for datacenter-style RPC workloads. The project is built on the open-source Homa Linux kernel module and its benchmarking utilities, and uses CloudLab-style multi-node experiments that replay the Homa paper's W4 Hadoop-inspired message-size distribution. Our implementation work focuses on three minimum deliverables proposed at the start of the project: DCTCP, TCP Fast Open (TFO), and connection pooling. We also implemented and evaluated three additional application-level variants motivated by the same hypothesis: HTTP/2-style multiplexing, staggered request scheduling, and load-aware session scheduling. The strongest current result is that plain DCTCP and DCTCP+TFO do not produce stable loaded runs in the current non-pooled path, whereas pooled and load-balanced TCP variants do complete the workload and achieve throughput comparable to or slightly above Homa. However, Homa still retains a clear latency advantage, especially for short messages and tail behavior. At this point, the exploratory and implementation-heavy parts of the project are largely complete; what remains is to validate the final hypothesis with cleaner end-to-end comparisons, especially for the additional TCP variants, and to resolve the remaining measurement caveats around ECN and staggered scheduling instrumentation.
+\end{abstract}
+
+\section{Introduction}
+
+Modern datacenter applications are dominated by RPC-heavy communication patterns in which services exchange large numbers of short, latency-sensitive messages while also competing with larger background transfers. This workload mix appears in microservices, search, storage, analytics, and AI pipeline coordination. In such environments, transport behavior matters at both the median and the tail: a query often completes only after the slowest shard or the last dependent RPC returns, so queueing and retransmission effects can dominate end-to-end application latency even when average throughput remains high.
+
+The specific problem in this project is whether TCP is fundamentally mismatched to these datacenter RPC workloads, or whether much of the gap reported in prior work comes from baseline choices rather than unavoidable protocol limitations. Homa is explicitly designed to reduce head-of-line blocking, prioritize short messages, and keep receiver downlinks from collapsing under fan-in. By contrast, a naive TCP baseline can suffer from connection setup overhead, byte-stream ordering effects, and synchronized incast behavior. Our project asks whether these disadvantages remain after TCP is tuned using mechanisms that production systems already use or can plausibly deploy at the application or transport boundary.
+
+Existing work argues strongly that Homa outperforms TCP and DCTCP for mixed-size datacenter workloads, especially at high percentiles for short messages. The Homa/Linux paper reports much lower median and P99 latency than TCP and DCTCP, and frames the protocol advantage as structural rather than incidental. At the same time, critiques of the ``replace TCP'' argument note that the practical TCP design space is larger than a single baseline configuration. In particular, connection reuse, congestion control tuned for datacenter fabrics, and application-layer strategies for reducing message-level blocking may narrow part of the gap. The limitation in existing comparisons, from our perspective, is that they do not exhaustively test these mitigations in a single framework built directly around the Homa benchmark environment.
+
+Our hypothesis is that a carefully tuned TCP stack can recover a meaningful fraction of the performance gap relative to Homa, and may match or exceed Homa on some throughput-oriented metrics, but is unlikely to fully eliminate Homa's latency advantage under the W4 workload. More concretely, we expected DCTCP to reduce queue buildup, TFO to remove connection setup costs for short requests, and connection pooling to eliminate repeated handshake and slow-start penalties. We further expected that multiplexing, staggered scheduling, and load-aware session assignment would attack the same head-of-line and incast pathologies that motivate Homa, but from user space.
+
+Our approach is to reproduce the Homa evaluation style as faithfully as possible using the HomaModule repository, CloudLab-style node configurations, and the W4 workload family already supported by the benchmark utilities. We first reproduced baseline Homa, TCP, and DCTCP behavior using the built-in \texttt{cp\_basic} and related tooling. We then extended the TCP-family path with DCTCP configuration, TFO support, socket reuse through pooling, multiplexed long-lived sessions, staggered client scheduling, and load-aware session selection. The current report synthesizes those code changes, the saved experiment logs, the derived slowdown and CDF plots, and the remaining instrumentation caveats.
+
+The central outcome at this progress-report stage is that the project has moved beyond exploration. The testbed, workload, and most of the coding work are in place. We now have concrete results showing both where TCP-family optimizations help and where they do not. The remaining work is not to decide what to build, but to refine the strongest comparisons, close the known measurement gaps, and determine whether the final evidence validates or rejects the hypothesis in its current form.
+
+\section{Background and Motivation}
+
+\subsection{Related Work}
+
+The primary reference point for this project is Homa itself. Homa is a receiver-driven transport protocol designed for RPC workloads in datacenters, where the dominant concern is low tail latency for short messages under high load. In the original Homa work and the later Homa/Linux implementation, the key idea is that receivers should control which senders may transmit scheduled data, thereby approximating shortest-remaining-processing-time scheduling and sharply reducing the queue buildup that harms small RPCs. Homa also avoids the stream semantics of TCP, which means independent messages are not forced to wait behind unrelated bytes in a single ordered stream \cite{homa-linux}.
+
+The 2021 Homa/Linux paper is especially important for our project because it presents a practical Linux kernel implementation rather than a simulation or kernel-bypass prototype. That paper reports that Homa/Linux provides lower latency than TCP and DCTCP across all message sizes tested, and much lower tail latency for short messages in mixed workloads. It also argues that once Homa removes most network-side congestion, software overhead becomes the dominant bottleneck. That framing is relevant to our study because it suggests that even if a tuned TCP stack improves transport behavior, a protocol designed around message scheduling may still have structural latency advantages \cite{homa-linux}.
+
+At the same time, not all prior commentary accepts the strongest form of the ``replace TCP'' argument. The proposal materials for this project highlighted Ivan Pepelnjak's critique that the practical impact of TCP's limitations may be overstated if the baseline uses deployment choices uncommon in production systems. The critique is not that TCP is ideal, but that the comparison space should include mitigations such as persistent connections, smarter application-layer behavior, and congestion control designed for datacenter fabrics. That critique motivated the project directly: if Homa's advantage partly depends on an under-optimized TCP baseline, then a stronger TCP-family comparison is necessary before concluding that TCP must be replaced.
+
+Head-of-line blocking is another major motivation. Scharf and Kiesel analyze head-of-line blocking in stream-oriented transports and show that ordered byte-stream semantics can delay unrelated messages when they share a connection \cite{hol}. This matters for our workload because W4 contains a wide range of message sizes, and the fan-out/fan-in structure makes tail latency sensitive to any large response or loss event that delays completion. Their analysis supports the core Homa critique of TCP, but it also clarifies why application-layer mitigations such as multi-streaming, multiple sessions, and request scheduling might improve behavior without replacing the transport entirely.
+
+Finally, DCTCP itself is relevant because it represents an optimized TCP-family baseline rather than a generic Internet congestion controller. DCTCP uses ECN feedback to reduce queue occupancy in shallow-buffer datacenter environments. In theory, that should align better with our target setting than ordinary loss-based TCP. For this reason, our minimum deliverables deliberately included DCTCP as the first step in building a stronger TCP baseline. If DCTCP already fails badly on the workload, that is strong evidence for Homa; if it succeeds when paired with other mitigations, the comparison becomes more nuanced.
+
+\subsection{Hypothesis and Motivation}
+
+The hypothesis for this project is not simply that ``TCP can beat Homa.'' The more precise hypothesis is that a carefully tuned TCP stack, when evaluated under realistic datacenter RPC workloads and compared fairly against Homa in the same framework, can recover enough of Homa's reported advantage to challenge the claim that TCP is fundamentally unfit for such workloads. The mechanism-level expectations behind this hypothesis are specific:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item DCTCP should reduce standing queues by reacting to ECN rather than waiting for drops.
+  \item TFO should reduce the cost of short RPCs by allowing early data and avoiding a full extra handshake round trip.
+  \item Connection pooling should prevent repeated connection setup and repeated slow-start penalties.
+  \item HTTP/2-style multiplexing should reduce message-level head-of-line blocking by allowing independent RPCs to share a warm transport session.
+  \item Staggered request scheduling should reduce synchronized incast pressure by deliberately spreading response timing.
+  \item Load-aware session scheduling should reduce per-session imbalance so that large RPCs do not repeatedly block small ones behind a poor socket assignment.
+\end{itemize}
+
+The motivation for testing all of these together is that Homa's reported benefits are compound. Homa does not merely optimize congestion control or remove one handshake; it changes the transport's entire scheduling model around message boundaries, priorities, and receiver control. A fair challenge to Homa therefore should not compare it only to a default TCP stack. It should compare it to a TCP-family stack that has been tuned at the congestion-control, connection-management, and application-scheduling layers.
+
+At the same time, our hypothesis already acknowledged that some Homa advantages may remain even after tuning. In particular, if Homa's message-oriented semantics and receiver-driven scheduling fundamentally reduce tail interactions between short and long messages, then TCP-family variants may still fall short in the latency distribution even when their throughput is competitive. The current results increasingly support this more limited form of the hypothesis: TCP can recover throughput and operational stability with the right design choices, but Homa continues to hold a meaningful latency advantage.
+
+\subsection{Key Results So Far}
+
+Three results currently define the state of the project. First, the baseline \texttt{cp\_basic} reproduction successfully recovered a usable Homa versus TCP versus DCTCP table in the style of Table 2 from the Homa paper. On the 5-node setup available in the saved artifacts, Homa clearly wins the small-message latency and client RPC-rate metrics, while TCP and DCTCP are much stronger for the 500 KB single-message throughput point and somewhat stronger for bulk throughput. This confirms that our local environment reproduces the broad tradeoff pattern of the prior work rather than producing arbitrary numbers.
+
+Second, in the 5-node W4 transport comparison, the plain unpooled DCTCP and DCTCP+TFO variants did not generate usable loaded RTT datasets in the latest canonical run. Their logs show clients pinned at the outstanding RPC limit and essentially no useful progress in the loaded phase. That outcome is important because it is a negative result for the simplest form of the hypothesis: merely enabling DCTCP, or DCTCP plus TFO, is not sufficient to make the TCP-family path competitive in this environment.
+
+Third, the stronger TCP-family variants do work. Connection pooling produced a stable loaded run with throughput slightly above Homa's server-side throughput, though still with noticeably worse latency. The later counter-enabled run further shows that HTTP/2-style multiplexing, staggered scheduling, and load-aware session scheduling all complete enough traffic to produce dense RTT digests and slowdown curves. Among those, the load-aware variant currently looks strongest on aggregate throughput and on elimination of backed-up sends, while Homa still has the better short-message latency profile. This means the project has already produced meaningful positive and negative evidence, which is exactly what the progress report is supposed to demonstrate.
+
+\section{Approach}
+
+\subsection{System Under Study}
+
+The project uses the HomaModule repository as both the subject system and the experimental framework. The repository contains a Linux kernel implementation of Homa as well as the \texttt{cperf} benchmarking tools and the \texttt{cp\_node} application used to generate RPC traffic. This was an intentional project choice because it allows us to compare Homa against TCP-family variants inside one codebase, one workload generator, and one results pipeline instead of stitching together incomparable systems.
+
+The workload of interest is the W4 distribution derived from Hadoop-style traffic in the Homa work. In this workload, requests are small, while responses are drawn from a heavy-tailed distribution with many short messages and a meaningful tail of larger ones. The benchmark structure is effectively a partition/aggregate pattern: one logical requester fans out requests and waits for replies from a set of servers. This pattern is useful because it naturally exposes both transport-level and application-level head-of-line effects. A single delayed response can become the tail for the larger operation.
+
+The current saved experiments include both 10-node baseline-style runs and 5-node runs. The project proposal originally targeted a 10-node setup that mirrors the Homa paper more closely, namely one client and nine servers on CloudLab xl170-class nodes. However, the artifact set collected for this progress report also includes 5-node runs that were used for transport debugging and for more rapid iteration on TCP-family variants. In those 5-node runs, one node acts as a server and four nodes act as clients during the loaded phase. Although this is smaller than the target environment, it still produces meaningful queueing, fan-in pressure, and throughput saturation behavior.
+
+\subsection{General Experimental Approach}
+
+Our implementation and evaluation strategy proceeded in three concrete stages, and those stages closely follow the chronology of the actual code and artifact development captured in the repository.
+
+\paragraph{Stage 1: reproduce the Homa paper's baseline TCP and DCTCP behavior.}
+The first step was not to introduce new optimizations, but to establish a faithful local baseline. We reproduced the vanilla TCP and DCTCP comparisons exposed by the Homa benchmarking utilities in our CloudLab environment so that later results would be anchored to the same codebase, workload generator, and reporting pipeline used by HomaModule itself. This stage served two purposes. First, it verified that our CloudLab deployment and Homa runtime were working at all. Second, it told us whether the broad claims in the Homa paper qualitatively reproduced in our environment before we started ``improving'' TCP. This was essential because any later claim about tuned TCP would be weak if the baseline itself had not been reproduced in a controlled and explainable way.
+
+The baseline stage also forced us to understand the HomaModule evaluation workflow end to end. We had to bring up the kernel module on every node, build the benchmark utilities, run the built-in \texttt{cp\_basic} and \texttt{cp\_vs\_tcp}-style experiments, and confirm that the resulting summaries were consistent with the Homa paper's qualitative story: Homa leads strongly on small-message latency, while TCP-family transports can remain competitive or stronger on some bulk-throughput points. Once that baseline was established, we could treat subsequent TCP changes as deliberate interventions rather than uncontrolled modifications.
+
+\paragraph{Stage 2: implement TCP Fast Open and extend the measurement pipeline.}
+The second stage began with TCP Fast Open, but it quickly became clear that adding a single transport feature was not enough. We also had to adjust the testbed and experiment wrappers to retain the artifacts necessary for serious comparison. In practice this meant extending the scripts to preserve per-run result directories, aggregate logs, RTT traces, Homa metrics, TCP kernel counters, and queue-discipline state. The saved notes and assets reflect this shift clearly: by the time the current artifact set was produced, the runs were no longer treated as one-off benchmark invocations, but as structured experiments whose logs, slowdown digests, CDF data, and transport counters could be revisited later.
+
+This stage was important for another reason: it expanded the project from ``can we turn on TFO?'' to ``can we observe why the variants differ?'' TFO by itself only addresses handshake overhead. It does not explain whether a run succeeds because of better forward progress, fewer retransmissions, reduced queue buildup, or fewer stalled sessions. As a result, we modified the evaluation path to save kernel TCP counters such as retransmissions, timeouts, and ECN-capable packet counts, as well as qdisc snapshots and raw RTT traces. That instrumentation is what made the later discussion of pooling, multiplexing, staggered scheduling, and load-aware assignment scientifically useful rather than anecdotal.
+
+\paragraph{Stage 3: implement and compare higher-level TCP optimizations.}
+The third stage broadened the project into multiple TCP-family variants intended to attack the same failure modes Homa is designed to avoid. This included connection pooling, HTTP/2-style multiplexing, staggered scheduling, and load-aware session scheduling. Once these features existed in the codebase, the project became less about adding one optimization at a time and more about establishing a comparison framework in which multiple policies could be turned on and off under the same workload and load target.
+
+The important point is that these optimizations were not chosen arbitrarily. Connection pooling targets repeated setup and cold-start behavior. Multiplexing targets byte-stream-induced message serialization. Staggered scheduling targets synchronized incast and reply bursts. Load-aware session scheduling targets self-inflicted queue imbalance across multiple warm sessions. Together, they form a coherent argument: if Homa wins because TCP is suffering from connection overhead, queue imbalance, or message-level head-of-line effects, then a tuned TCP-family stack should be tested against exactly those issues rather than against a default configuration.
+
+\subsection{Design of the TCP Variants}
+
+The project began with three minimum deliverables proposed before implementation started.
+
+\paragraph{DCTCP.}
+The first modification was to enable DCTCP and ECN support in the TCP baseline. The intended effect was to keep queues shallow and reduce the burst-amplified queueing delay that hurts short RPCs. This is the most direct transport-level response to the Homa paper's claim that TCP pays too much latency waiting for congestion signals.
+
+\paragraph{TCP Fast Open.}
+The second modification was TFO. The goal here was not to redesign the transport, but to remove the handshake tax that hurts short and bursty connections. In the code and test scripts, this required enabling the relevant kernel option and using the TCP fast-open path on the client and server sides where applicable.
+
+\paragraph{Connection Pooling.}
+The third minimum deliverable was connection pooling. Instead of opening a fresh TCP connection for each exchange, the client can maintain a pool of already-established sessions to each receiver. This keeps the congestion window warm, avoids repeated setup, and provides a first-order mitigation against the misleadingly weak ``one fresh TCP connection per RPC'' style baseline.
+
+We then added three extended optimizations that are still directly tied to the hypothesis rather than being unrelated extras.
+
+\paragraph{HTTP/2-style multiplexing.}
+This variant keeps a small number of long-lived sessions and multiplexes many logical RPCs over them. The motivation is to approximate a message-interleaving model within a TCP family design so that independent short requests do not have to wait behind a single monolithic serialization path.
+
+\paragraph{Staggered scheduling.}
+This variant intentionally spreads requests or replies in time to reduce synchronized fan-in. Conceptually, this is an application-layer response to incast collapse: if too many senders inject replies toward the same receiver at once, the queueing spike can dominate latency and trigger retransmissions. Staggering is meant to smooth that spike without requiring a new transport protocol.
+
+\paragraph{Load-aware session scheduling.}
+This variant maintains multiple sessions per peer and assigns a new RPC to the least-backed-up session rather than using a static or naive assignment. The key insight is that if the application already knows RPC boundaries and expected response sizes, then it can avoid repeatedly placing short work behind large work on the same connection. This is not equivalent to Homa's packet-level scheduling, but it is a practical user-space approximation.
+
+\subsection{Scope Changes During Implementation}
+
+Two implementation decisions meaningfully changed the project relative to the original proposal, and both were pragmatic rather than conceptual.
+
+First, for two of the proposed extended optimizations we deliberately skipped the original ``phase 1'' ideas and went directly to what the proposal called ``phase 2.'' For multiplexing, the proposal listed a simpler phase and then a stronger multiplexed persistent-session design. We moved directly to the more complete version because it was both feasible in the existing code and better aligned with the actual comparison we cared about. Spending time on a weaker intermediate design would have generated another point on the path, but not a more informative one. The same logic applied to scheduling. We skipped the simpler first phase and went straight to a more substantive scheduling policy because the richer version was feasible in the current codebase and gave a more meaningful comparison against Homa's ability to manage queueing and fan-in behavior.
+
+Second, we temporarily shifted the primary active testbed from the proposed 10-node xl170 setup to a 5-node CloudLab deployment using c6525-25g nodes. This was largely a resource-availability decision: the c6525-25g nodes were more readily available while still preserving the important 25 Gbps NIC requirement for stressing the transport. That decision let us make much faster progress on code bring-up, debugging, and repeated transport runs. We do not treat the 5-node results as the final word on the project. Instead, they are the current implementation and validation platform, with the intended next step being a return to the more faithful 10-node xl170-style setup once the strongest TCP-family variants are sufficiently tuned.
+
+\subsection{Proposal Versus Outline}
+
+The later project outline is, in practice, more faithful to the work we actually completed than the earlier proposal. The initial proposal established the broad research question correctly: challenge the claim that TCP must be replaced in the datacenter by evaluating Homa against better-tuned TCP-family alternatives on CloudLab. However, the proposal still described the work at a relatively high level and left several implementation choices underspecified. The outline sharpened those choices substantially by identifying explicit minimum deliverables, dividing the additional optimizations by owner, and breaking the TCP-family work into concrete design directions centered on DCTCP, TFO, connection pooling, multiplexing, staggered scheduling, and session load balancing.
+
+That outline maps closely onto the actual trajectory of the codebase. The minimum deliverables from the outline correspond directly to the work we implemented first: DCTCP, TCP Fast Open, and connection pooling. The outline's extended goals also correspond closely to the later saved artifacts: HTTP/2-style multiplexing, staggered scheduling, and load-aware session scheduling all appear in the current experiment pipeline and result files. In that sense, the outline was not merely aspirational; it became the working implementation plan.
+
+There are still a few differences between the written outline and the project as executed so far. The outline described a phase-by-phase progression for multiplexing and scheduling, but in practice we skipped some of those intermediate steps and moved directly to the stronger implementations that were most informative and most feasible. The outline also assumed a cleaner return to the 10-node CloudLab environment earlier in the process, whereas actual resource constraints and debugging needs made the 5-node c6525-25g platform the more effective active development environment. Finally, the outline envisioned a smoother progression from baseline reproduction into optimization studies. In practice, a substantial portion of the project effort was consumed by getting the benchmarking infrastructure, Homa runtime, and CloudLab deployment stable enough that those comparisons were trustworthy.
+
+\subsection{Implementation Details}
+
+The implementation work in the saved notes included several important debugging and correctness fixes in the benchmark path itself. In particular, the TCP client epoll dispatch logic in \texttt{util/cp\_node.cc} was corrected so that client-side epoll events were associated with the stored connection identifier rather than the socket file descriptor. This mattered because incorrect dispatch can make the TCP path appear much worse than it actually is by misrouting or dropping application-level progress.
+
+The non-pooled TCP receive path in \texttt{util/cp\_node.cc} was also fixed so that clients no longer closed a connection after any readable event before a full response had arrived. That bug directly affects the validity of any non-pooled TCP comparison. In parallel, \texttt{util/cp\_transport\_vs\_dctcp} was updated so that weaker non-pooled variants could be run longer without changing the pooled cases, which is useful for distinguishing an instrumentation artifact from a real lack of progress.
+
+Finally, \texttt{util/cperf.py} was updated so that slowdown digesting uses sample-sized buckets rather than exact-length-only buckets when a dataset is sparse. This improves the quality of the resulting slowdown plots for partially sparse datasets, though in the latest canonical run the plain DCTCP and DCTCP+TFO experiments still ended with no usable RTT samples and are correctly treated as failed loaded runs rather than merely noisy ones.
+
+It is also important to emphasize how much engineering work was required just to make the baselines runnable and reproducible. Although HomaModule ships with benchmark utilities and CloudLab support material, reproducing the baseline was not a matter of running one canned script. We had to make the benchmark code, the Homa module deployment path, the CloudLab node bootstrap path, and the artifact collection path all line up. That meant repeatedly dealing with the \texttt{homa.ko} build and load cycle, making sure the correct binaries were installed under \texttt{\textasciitilde/bin} and in system-visible locations, synchronizing runtime files from the repo to each node, and reconciling naming and path conventions that vary across the module and helper scripts, such as \texttt{HomaModule} versus \texttt{homaModule}, \texttt{node0} versus \texttt{node-0}, and different expectations about where utilities and logs should live.
+
+That inconsistency was not fatal, but it did increase the replication burden. Getting a run to succeed often required more than verifying the benchmark command itself; it required making sure the right module image, helper binaries, Python utilities, SSH aliases, host mappings, and shell environment were present and consistent on every participating node. In other words, a nontrivial fraction of the project's coding effort went into turning HomaModule from a research codebase with useful scripts into a repeatable experimental harness that we could confidently use for baseline reproduction and optimization comparison.
+
+Together, these implementation changes matter for the scientific validity of the project. A tuned TCP variant should only be judged after the application path, connection management path, and result digestion path all behave correctly. The current report therefore treats both code fixes and performance measurements as part of the experimental methodology rather than as separate activities. As the number of transport variants grew, this also became a software-engineering problem in its own right: each added optimization increased the state space of feature interactions, made debugging harder, and increased the burden of preserving clean, comparable artifacts across multiple runs.
+
+\section{Evaluation}
+
+\subsection{Experimental Setup}
+
+The experiments use the benchmarking utilities already provided in the HomaModule repository, but the local CloudLab setup and execution path were adapted to fit the current project workflow. The primary active testbed for this progress report is a 5-node CloudLab deployment using c6525-25g machines. We chose this platform because it preserved the project's desired 25 Gbps NIC class while being substantially more available than the larger target cluster during the implementation-heavy phase of the project. In the active configuration, one node serves as \texttt{node0} and acts as both the orchestration point and the loaded server during the main W4 transport runs; the remaining four nodes act as clients.
+
+The local bootstrap process is automated by the repository's SSH setup scripts. In the 5-node path, the script creates local SSH aliases for all five CloudLab nodes, installs keys, configures passwordless SSH from the local machine and from \texttt{node0} to the other nodes, and then builds the Homa repository and utilities on \texttt{node0}. It also installs the relevant runtime packages, copies \texttt{cp\_node}, \texttt{homa\_prio}, and helper Python scripts into the expected locations, and enables DCTCP and TFO kernel settings on all nodes. The transport experiment wrapper then rsyncs the updated benchmark sources to \texttt{node0}, copies the built runtime to all participating machines, refreshes the Homa kernel module on every node, populates \texttt{/etc/hosts} with the private cluster IPs, and sets machine-level runtime knobs such as RPS flow entries, receive interrupt moderation, CPU frequency governor, and Homa sysctls before launching the actual benchmark.
+
+The loaded transport runs of greatest interest here use the W4 workload and target approximately 20 Gbps offered load in the 5-node transport comparison logs, with four clients each offered 5 Gbps toward one server. The key benchmark option set in the latest counter-enabled run includes \texttt{--client\_max 200}, \texttt{--gbps 20.0}, \texttt{--seconds 10}, \texttt{--workload w4}, and transport-specific flags that enable or disable pooling, TFO, HTTP/2-style multiplexing, load-aware routing, and staggered scheduling.
+
+For Homa, the latest canonical run also records the Homa-specific parameters used during the experiment, including \texttt{grant\_increment 10000}, \texttt{rtt\_bytes 60000}, \texttt{max\_nic\_queue\_ns 2000}, \texttt{poll\_usecs 50}, \texttt{link\_mbps 25000}, and \texttt{num\_priorities 8}. These values matter because they determine how aggressively Homa's receiver-driven scheduling and pacing logic can smooth fan-in while still keeping the link busy.
+
+For the TCP-family experiments, the benchmark scripts explicitly configure \texttt{net.ipv4.tcp\_congestion\_control=dctcp} and \texttt{net.ipv4.tcp\_ecn=1}. TFO is enabled with \texttt{net.ipv4.tcp\_fastopen=3} in the TFO variants and disabled otherwise. The latest counter-enabled run also captures \texttt{nstat} TCP/IP counters before and after each experiment, producing per-experiment files that record retransmissions, timeouts, delivered packets, and ECN-related counters.
+
+\subsection{Workload: Why W4 Matters}
+
+The project intentionally centers the W4 workload because it is the most relevant built-in workload for testing the hypothesis. In HomaModule, W4 is a heavy-tailed distribution intended to approximate a Hadoop-style response-size distribution used in the Homa evaluation. It is not a synthetic load in the sense of ``all messages are the same size''; instead, it contains a large concentration of short and medium messages along with a long tail of much larger responses. That combination is exactly what makes transport comparison interesting, because it creates the conditions under which short messages can be delayed behind larger transfers and under which queue growth and incast behavior become visible.
+
+The saved distribution definition in \texttt{util/dist.cc} makes the shape concrete. The smallest messages appear in the tens of bytes, and the distribution crosses only about \(10.3\%\) cumulative probability by \(315\) bytes, which is why the short-message CDF plots in the artifact set cut off around that size threshold. The median mass of the distribution lives in the sub-kilobyte to low-kilobyte region, but the tail extends far beyond that: around \(67\%\) of responses are below roughly \(1.7\) KB, around \(71\%\) remain below roughly \(18\) KB, around \(84\%\) are still below about \(75\) KB, around \(95\%\) are below a few hundred kilobytes, and the distribution eventually stretches all the way to \(10\) MB. That is a severe enough tail to expose both transport-level and application-level head-of-line effects without requiring the experiment to invent artificial background traffic.
+
+W4 is therefore well matched to the project hypothesis. If TCP suffers because a small reply gets trapped behind a larger flow on a connection, W4 creates that opportunity. If Homa's scheduling advantage is real, W4 should make it visible. If connection pooling, multiplexing, or load-aware scheduling help TCP by keeping sessions warm and reducing imbalance, W4 should also make that visible. In short, W4 is not just convenient because it ships with HomaModule; it is the workload that best stresses the exact claims under debate.
+
+The current report uses three main classes of artifacts:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item baseline summary tables from \texttt{cp\_basic},
+  \item slowdown and short-message CDF plots for the W4 workload,
+  \item saved logs and per-experiment counters from the latest counter-enabled transport run.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{asssets/charts/phase_1_w4_vs_tcp_w4.pdf}
+\caption{Earlier phase-style W4 slowdown figure preserved in the saved assets. This chart is useful as a historical comparison point because it reflects the period in which the project was establishing the baseline Homa-versus-TCP-family behavior before the final counter-enabled result layout was cleaned up.}
+\label{fig:phase1-slowdown}
+\end{figure}
+
+\subsection{Baseline Reproduction}
+
+Before evaluating the new TCP variants, we needed to confirm that the local environment reproduces the broad Homa-versus-TCP patterns reported in prior work. Table~\ref{tab:baseline} summarizes the recovered \texttt{cp\_basic} results in the style of Table 2 from the Homa paper.
+
+\begin{table}[H]
+\centering
+\caption{Baseline \texttt{cp\_basic} summary recovered from the saved 5-node reproduction. Each entry is the best value observed among the reported 5-second runs, matching the reporting style used in the saved summary artifact.}
+\label{tab:baseline}
+\begin{tabular}{lrrr}
+\toprule
+Metric & Homa & TCP & DCTCP \\
+\midrule
+100B latency (\(\mu s\)) & 22.29 & 27.80 & 26.51 \\
+500KB throughput (Gbps) & 6.00 & 19.36 & 19.46 \\
+Client throughput (Gbps) & 18.95 & 23.19 & 23.18 \\
+Server throughput (Gbps) & 18.33 & 23.11 & 23.14 \\
+Client RPC rate (Mops/s) & 1.367 & 0.653 & 0.642 \\
+Server RPC rate (Mops/s) & 0.824 & 1.004 & 0.996 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This baseline already tells an important story. Homa is clearly superior on the short-message latency point and on client RPC throughput, which is consistent with the core Homa claim that it is optimized for small, latency-sensitive RPCs. At the same time, TCP and DCTCP are substantially stronger for the single large-message throughput point and somewhat stronger on bulk throughput metrics. This means our local environment does not collapse into a one-dimensional ranking; instead, it reproduces the same kind of multi-metric tradeoff that motivated the project.
+
+This baseline reproduction also served as a practical systems milestone. Reproducing these numbers forced us to validate the CloudLab deployment, the Homa module load path, the TCP/DCTCP switching path, and the benchmark harness itself. In other words, the baseline is not just a result; it is evidence that the later TCP tuning work is being built on a functioning platform rather than on an unverified environment.
+
+It is worth stressing that this baseline reproduction took significant coding and systems effort. The Homa paper presents the baseline as a result table, but reproducing it locally required solving a long chain of practical issues: making sure \texttt{homa.ko} was rebuilt and loaded consistently on every node, ensuring helper binaries were copied to the right locations, making the CloudLab nodes able to ssh to one another under the expected aliases, reconciling script assumptions about file names and repository paths, and cleaning up stale runtime state between runs. The fact that we eventually recovered the baseline numbers is therefore itself an indicator of progress, because it means we successfully navigated those engineering barriers rather than simply assuming the environment worked.
+
+\subsection{Main W4 Transport Comparison}
+
+The most important evaluation data for the progress report comes from the 5-node W4 transport comparison and the later counter-enabled rerun. The current state of the variants is summarized in Table~\ref{tab:transport-summary}.
+
+\begin{table}[H]
+\centering
+\caption{Summary of the latest saved 5-node W4 transport results. Throughput and RPC-rate values are per-node averages from the latest counter-enabled run. ``Usable RTT dataset'' indicates whether the experiment produced enough RTT data to support slowdown and CDF analysis.}
+\label{tab:transport-summary}
+\begin{tabular}{p{4.0cm}cccc}
+\toprule
+Variant & Client Gbps & Server Gbps & Client Kops/s & Usable RTT dataset \\
+\midrule
+Homa & 4.70 & 18.92 & 9.8 & Yes \\
+DCTCP & n/a & 1.25 & n/a & No \\
+DCTCP + TFO & n/a & n/a & n/a & No \\
+DCTCP + TFO + Pooling & 5.03 & 20.07 & 10.2 & Yes \\
+DCTCP + TFO + HTTP/2 & 5.04 & 20.06 & 10.2 & Yes \\
+DCTCP + TFO + Staggered & 5.00 & 19.73 & 10.2 & Yes \\
+DCTCP + TFO + Load-Aware & 5.08 & 20.27 & 10.2 & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several conclusions follow directly from Table~\ref{tab:transport-summary}. First, the plain DCTCP and DCTCP+TFO experiments are not just weaker; in the latest canonical run they fail to produce any usable loaded RTT samples. This is an important negative result because it shows that basic transport-level tuning alone is not enough in this workload. Second, once pooling and better application-level scheduling are introduced, the TCP-family path becomes operationally healthy and reaches server throughput at or above Homa. Third, throughput parity does not imply latency parity, so the latency figures and digests must still be examined separately.
+
+Another important point is that the transport comparison is no longer just Homa versus one TCP baseline. The project now effectively has a ladder of TCP-family sophistication. At the bottom are plain DCTCP and DCTCP+TFO, which fail under load in the current setup. In the middle is pooled DCTCP+TFO, which becomes a valid high-throughput comparison point. At the top are the pooled variants with extra scheduling logic, which show that once the application is allowed to participate in session and request placement, the TCP-family path becomes much more robust. That ladder is valuable because it identifies which parts of the ``TCP can be tuned'' argument actually matter in practice.
+
+\subsection{Latency and Slowdown Behavior}
+
+Figure~\ref{fig:slowdown} shows the latest saved slowdown comparison from the counter-enabled transport run, and Figure~\ref{fig:cdf} shows the short-message CDF from the same artifact set.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{asssets/charts/vs_tcp_w4_p99_counters_run.pdf}
+\caption{Saved P99 slowdown comparison for the latest counter-enabled W4 transport run. The plotted TCP-family curves are the variants that completed enough traffic to produce stable digests; plain DCTCP and DCTCP+TFO are absent because they produced no usable RTT samples in this canonical run.}
+\label{fig:slowdown}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{asssets/charts/phase_1_w4_short_cdf_w4.pdf}
+\caption{Earlier phase short-message CDF artifact retained from the initial W4 comparison workflow. Its overall shape is consistent with the later counter-enabled short-message CDF and provides another visual checkpoint that Homa preserves the strongest low-latency behavior for the short-message region.}
+\label{fig:phase1-cdf}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{asssets/charts/short_cdf_w4_counters_run.pdf}
+\caption{Saved short-message CDF for the latest counter-enabled W4 transport run. This figure highlights Homa's advantage in the short-message latency region relative to the stable TCP-family variants.}
+\label{fig:cdf}
+\end{figure}
+
+The digested data underlying these plots makes the gap concrete. For Homa, the digested W4 data shows short-message bucket medians around \(160\) to \(190~\mu s\) and slowdown values typically in the \(6\) to \(8\times\) range for the smallest bucket region. For \texttt{DCTCP+TFO+Pooling}, the corresponding small-message medians are around \(380\) to \(430~\mu s\), with slowdown values around \(18\) to \(21\times\). The load-aware variant is similar, with small-message medians around \(420\) to \(460~\mu s\) and P99 slowdown values for the same short buckets often around \(140\) to \(170\times\). The absolute throughput of these TCP-family variants is good, but Homa remains clearly better for latency-sensitive traffic.
+
+The short-message CDF data reinforces this point. In the saved CDF digests for messages up to \(315\) bytes, Homa's distribution extends into the \(25\) to \(40~\mu s\) region much more strongly than the pooled TCP-family baseline. The pooled DCTCP+TFO curve begins around \(30~\mu s\) and rises more slowly through the \(30\) to \(60~\mu s\) region. This does not mean pooled TCP is poor in absolute terms; it means that even after major tuning, Homa still retains an advantage exactly where its design is supposed to matter most.
+
+The shape of the slowdown curves also suggests a useful interpretation. Homa's curve is not flat in an absolute sense; it still shows slowdown under offered load, which is consistent with the overload and BUSY/NEED\_ACK evidence in the logs. However, its slowdown remains much more controlled for the short buckets that dominate latency-sensitive RPC traffic. By contrast, the stable TCP-family variants show that once the system is loaded, the short-message region already carries a significantly larger relative penalty. That is exactly the kind of behavior one would expect if even a warmed-up TCP-family stack is still paying for queue interactions and serialization effects that Homa's receiver-driven message scheduling mitigates more directly.
+
+\subsection{Queueing, Retransmissions, and Operational Signals}
+
+The saved logs and counters provide a more mechanistic explanation for why the variants differ.
+
+\paragraph{Homa.}
+Homa clearly completed the workload, but it also showed substantial queue growth and overload signals in the 5-node W4 runs. The saved notes report average outstanding RPCs around \(158.55\), a maximum of \(198\), average lag due to overload around \(8.42\%\), and a maximum lag of \(16.2\%\). Homa metrics in the corresponding saved artifacts also show large values for \texttt{BUSY}, \texttt{NEED\_ACK}, \texttt{resent\_packets}, and \texttt{ack\_overflows}. This means Homa is not avoiding all congestion-like stress; rather, it is controlling the workload well enough to preserve significantly better latency than the TCP-family alternatives.
+
+\paragraph{Plain DCTCP and DCTCP+TFO.}
+These variants fail operationally in the current environment. In the latest canonical run, the DCTCP experiment produced only \(1.25\) Gbps at the server and no usable client summary, while the TFO-only experiment produced no usable throughput summary at all. The logs show outstanding RPC counts pinned at the limit, indicating that the clients saturate their concurrency window without making enough forward progress to generate a healthy RTT dataset. The aggregate counters are consistent with this failure mode: only \(5\) ECT(0) packets were observed in each case, total delivered packets are tiny, and retransmission/timeout counts are nonzero despite the very small amount of completed work.
+
+\paragraph{DCTCP+TFO+Pooling.}
+Pooling is the first TCP-family variant that behaves like a valid comparison point rather than a failed experiment. It reaches \(20.07\) Gbps server throughput and \(10.2\) Kops/s client RPC throughput per client node average in the latest counter-enabled run. The logs show much lower outstanding RPC counts than Homa and only \(1.9\%\) average backed-up RPCs. The aggregate counters show \(43{,}034{,}594\) ECT(0) packets, \(502\) retransmitted segments, and only \(2\) TCP timeouts, indicating a live and mostly stable high-throughput transport regime.
+
+\paragraph{HTTP/2-style multiplexing.}
+The multiplexed variant also completes the workload successfully and achieves \(20.06\) Gbps server throughput. It has the cleanest retransmission profile of the stable TCP-family variants in the latest counter-enabled run: only \(1\) retransmitted segment and no recorded TCP timeouts in the aggregate counter file. However, it still shows an average backed-up RPC rate of \(12.9\%\), much higher than pooling or staggered scheduling. This suggests that multiplexing preserves throughput well but still experiences local serialization or buffering effects that show up as application-visible backpressure.
+
+\paragraph{Staggered scheduling.}
+The staggered variant also produces a stable loaded run, with \(19.73\) Gbps server throughput and only \(1.9\%\) average backed-up RPCs. Its retransmission count is higher than pooling and HTTP/2-style multiplexing, with \(1245\) aggregate retransmitted segments and \(4\) timeouts. Moreover, the latest notes explicitly record a caveat: the temporary \texttt{tc netem} setup for the staggered case still emits \texttt{RTNETLINK answers: No such device} in the saved logs. As a result, the staggered data is promising but should not yet be treated as a completely clean validation of the intended injected-loss or ECN scenario.
+
+\paragraph{Load-aware session scheduling.}
+The load-aware variant is currently the strongest all-around TCP-family result in throughput terms. It reaches \(20.27\) Gbps server throughput and \(5.08\) Gbps client throughput per node average, the best aggregate throughput among the stable TCP-family variants in the latest canonical run. Most strikingly, its saved logs report \(0.0\%\) average backed-up RPCs across all sampled clients. Its counter file still shows meaningful retransmission activity (\(1270\) retransmitted segments and \(1216\) fast retransmissions), so the variant is not magically congestion-free. Instead, the result suggests that load-aware assignment is effective at avoiding persistent queue imbalance across pooled sessions even while the network remains busy.
+
+Across these variants, the emerging hypothesis for the observed behavior is straightforward. Plain DCTCP and DCTCP+TFO appear to fail because they still expose each RPC stream to severe connection-level or session-level blocking, so once the workload becomes heavy, the clients fill their outstanding window and stop making visible forward progress. Pooling fixes the largest part of that problem by keeping multiple warm sessions available. Multiplexing preserves throughput but appears to introduce a different form of application-visible backpressure, likely because a small number of highly utilized long-lived sessions still concentrate contention. Staggering reduces send-side backup and likely smooths burst timing, but its artifact set still needs cleaner netem validation. Load-aware scheduling appears strongest because it directly addresses the session imbalance that causes a short request to be placed behind a larger queued transfer on an already-busy session.
+
+\subsection{Counter Summary}
+
+Table~\ref{tab:counters} consolidates the aggregate TCP counter deltas from the latest counter-enabled run. These values are useful because they let us distinguish complete, healthy runs from runs that barely moved traffic.
+
+\begin{table}[H]
+\centering
+\caption{Aggregate TCP/IP counter deltas from the latest counter-enabled W4 transport run.}
+\label{tab:counters}
+\begin{tabular}{lrrrr}
+\toprule
+Variant & ECT(0) Pkts & Retrans Segs & Fast Retrans & TCP Timeouts \\
+\midrule
+DCTCP & 5 & 9 & 0 & 7 \\
+DCTCP + TFO & 5 & 22 & 0 & 16 \\
+DCTCP + TFO + Pooling & 43,034,594 & 502 & 487 & 2 \\
+DCTCP + TFO + HTTP/2 & 41,102,194 & 1 & 0 & 0 \\
+DCTCP + TFO + Staggered & 42,632,997 & 1245 & 1231 & 4 \\
+DCTCP + TFO + Load-Aware & 43,710,699 & 1270 & 1216 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations are especially important. First, the failed variants are obvious: their ECT(0) counters are effectively zero because they did not complete enough traffic to enter a meaningful steady state. Second, the stable TCP-family variants move tens of millions of ECN-capable packets, which means their throughput results are not based on trivial or underloaded executions. However, the same counter files also show that \texttt{TcpExtTCPDeliveredCE} and \texttt{IpExtInCEPkts} remained at zero in the latest saved run. Therefore, while the traffic is ECN-capable, the artifacts do not yet show explicit delivered CE-mark evidence. This is a measurement limitation that must be stated clearly.
+
+The zero CE-mark observation is particularly interesting. It does not necessarily mean DCTCP is irrelevant; rather, it means the present setup is not yet giving us a clean direct view into the ECN-marking regime we originally hoped to study. The likely explanations include switch or qdisc configuration details, insufficient mark generation under the present queue behavior, or instrumentation mismatches between where congestion is occurring and where marks are being counted. This is one of the most important remaining validation tasks because it affects how strongly we can attribute the observed TCP-family behavior to DCTCP specifically rather than to the higher-level connection-management optimizations layered on top of it.
+
+\subsection{Interpretation}
+
+The current evaluation supports a nuanced conclusion. The strongest form of the anti-Homa hypothesis is not supported: simply using DCTCP, or DCTCP with TFO, does not make TCP competitive in the current workload. Those variants fail to make enough progress under load. However, the broader and more realistic form of the hypothesis is partially supported: once the TCP-family design includes pooling and better application-layer scheduling, the transport becomes operationally strong and reaches throughput comparable to or slightly above Homa.
+
+At the same time, Homa still retains a clear latency advantage. This is visible in the short-message CDF, in the slowdown digests, and in the baseline summary table. In other words, the project has now produced evidence for both sides of the story. The tuned TCP-family stack can recover throughput and stability, which means the comparison must be more careful than ``TCP is obviously bad.'' But Homa still appears to deliver the better latency profile for the RPC-style workload that motivated its design in the first place.
+
+This is also where the 5-node c6525-25g setup matters analytically. The fact that these effects are already visible on a smaller, more readily available 25 Gbps testbed suggests that the differences are not a fragile artifact of one oversized cluster configuration. The 10-node xl170 configuration remains important for fidelity to the proposal and the paper-style setup, but the current 5-node results already provide strong evidence that the relative behavior of the variants is real enough to motivate further tuning and larger-scale validation.
+
+\section{Progress Report}
+
+\subsection{What Has Been Completed}
+
+Most of the exploratory work proposed for the project is complete.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item We established the benchmark environment inside the HomaModule repository and validated that the built-in tooling can reproduce a meaningful Homa/TCP/DCTCP baseline.
+  \item We completed the minimum deliverables at the implementation level: DCTCP support, TCP Fast Open support, and connection pooling support.
+  \item We implemented the three extended TCP-family variants proposed in the outline: HTTP/2-style multiplexing, staggered scheduling, and load-aware session scheduling.
+  \item We debugged critical correctness issues in the TCP client path and in the result-digestion path so that failed experiments can be distinguished from instrumentation artifacts.
+  \item We produced saved artifact sets for both baseline and transport-comparison runs, including slowdown plots, short-message CDFs, raw logs, Homa metrics, and aggregate TCP counter files.
+\end{itemize}
+
+This means the project is no longer in a literature review or bring-up phase. We have concrete code changes, multiple completed experiment classes, and already enough evidence to state interim conclusions.
+
+\subsection{What Remains}
+
+The remaining work is mostly validation and cleanup rather than major new implementation.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Re-run and further tune the strongest comparison configurations so that the final report can present the cleanest side-by-side Homa versus tuned TCP-family story.
+  \item Resolve the staggered-scheduling \texttt{tc netem} setup issue so that this variant can be interpreted without qualification.
+  \item Improve instrumentation around ECN-mark observation, because the latest saved counters show ECT(0) traffic but zero delivered CE counts.
+  \item Decide which stable TCP-family variant should be the primary final comparison point. Right now, pooling and load-aware scheduling are the leading candidates, with HTTP/2-style multiplexing also interesting due to its very low retransmission count.
+  \item Explore combinations of the existing optimizations rather than evaluating each only in isolation. The most obvious next step is to investigate whether pooling, load-aware routing, multiplexing, and carefully tuned staggering can be composed in a way that preserves throughput while reducing the latency penalty.
+  \item Tune the parameters of the existing variants, such as session counts, client/server port counts, stagger interval, and concurrency, rather than treating the current values as final.
+  \item Migrate the strongest configurations back onto the intended 10-node xl170-style testbed and evaluate whether the current behavior scales or changes materially in the more faithful deployment.
+  \item Expand the final write-up from a progress report into the full project report, including stronger discussion of negative results, final parameter choices, and the final interpretation of the hypothesis.
+\end{itemize}
+
+\subsection{What Changed from the Original Proposal}
+
+The original proposal emphasized a 10-node reproduction close to the Homa paper's setup. In practice, the saved artifact set for this progress report includes a mixture of 10-node baseline attempts and 5-node transport debugging and comparison runs. This is a meaningful change in scope, but not a change in scientific direction. The 5-node runs were used to accelerate iteration and were still sufficient to expose fan-in pressure, queueing, and transport differences under the W4 workload.
+
+Another change is that the project increasingly shifted from asking whether \emph{any} tuned TCP stack can match Homa to asking \emph{which} TCP-family optimizations are actually necessary before the comparison becomes meaningful. The saved results make clear that DCTCP and TFO alone are not enough. As a result, the project's center of gravity moved toward the pooled, multiplexed, and load-aware designs. This is a productive narrowing rather than a retreat from the original hypothesis.
+
+A second concrete change from the original approach is that we intentionally skipped the lighter ``phase 1'' versions of multiplexing and scheduling and moved directly to the stronger ``phase 2'' designs. We made that decision because the richer versions were already feasible in the codebase and because the simpler versions would have consumed time without answering the main research question as well. In effect, we optimized the implementation schedule in the same way we were trying to optimize the transport itself: we prioritized the versions most likely to produce informative results.
+
+There is also an infrastructure change worth stating explicitly. For the current progress-report stage we relied primarily on 5 c6525-25g CloudLab nodes because they were more readily available and still met the important 25 Gbps NIC constraint. The proposal's longer-term intention remains to revisit the full 10-node xl170-based setup, and the final report should discuss that migration and any differences it reveals.
+
+Compared directly against the original proposal, the outline also better captured the project's eventual division between minimum deliverables and extended optimizations. The proposal described the high-level idea correctly but left more room for interpretation about which TCP improvements would actually be implemented. The outline formalized those choices. Relative to that outline, the biggest executed changes were in sequencing and platform choice, not in research direction: we followed the same optimization families, but implemented them in a different order and on a more available 5-node platform first.
+
+\subsection{Challenges and Roadblocks}
+
+The project encountered several recurring challenges, some experimental and some purely operational.
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Correctness bugs and compatibility issues in the benchmark path.} Some early behavior was confounded by issues in client-side epoll dispatch and non-pooled receive handling. These had to be fixed before interpreting TCP-family performance results. More broadly, each added feature increased the number of code paths that could silently distort a comparison.
+  \item \textbf{Homa and benchmark instability under development.} The 10-node \texttt{cp\_vs\_tcp w4} baseline attempt was not a clean success because a Homa phase failed with receive timeouts. In other runs, the interaction between the evolving benchmark harness, the Homa runtime, and the experimental setup created failure modes that had to be distinguished from genuine transport behavior.
+  \item \textbf{CloudLab setup complexity.} Even once the code was compiling, turning raw CloudLab nodes into a stable benchmark cluster required nontrivial work: SSH bootstrapping, package installation, Homa module deployment, host configuration, runtime copying, sysctl tuning, and reproducible orchestration from \texttt{node0}. This setup burden was substantial and was a real part of the project effort.
+  \item \textbf{Replication friction inside HomaModule itself.} The repository includes the necessary pieces, but reproducing the baselines still involved navigating uneven naming conventions, multiple expected binary locations, helper scripts with different assumptions, and repeated handling of \texttt{homa.ko}, \texttt{\textasciitilde/bin}, host aliases, and result paths. We ultimately got this working, but the path to a repeatable baseline was significantly more manual and code-intensive than the final benchmark commands alone would suggest.
+  \item \textbf{Resource availability and node instability.} CloudLab resource availability constrained the testbed choices and directly influenced the shift toward the 5-node c6525-25g platform. In addition, some nodes became unstable, died unexpectedly, or effectively required a full reboot before they could be trusted again, which interrupted otherwise comparable runs and slowed iteration.
+  \item \textbf{Instrumentation gaps.} Although the latest run added aggregate TCP counter capture, the resulting files still show zero CE-delivery counters, so ECN's behavior is not yet visible as directly as desired.
+  \item \textbf{Staggered-scheduling setup noise.} The saved logs for the staggered case still include a \texttt{RTNETLINK answers: No such device} error in the temporary \texttt{tc} setup path, which means that part of the intended experiment needs cleanup before the final report.
+  \item \textbf{Growing comparison complexity.} As the codebase grew and more optimizations were added, implementing, validating, and comparing variants became increasingly difficult. Each optimization introduced new interactions, new knobs, and new failure modes. This made it harder to ensure that differences in results reflected the transport policy under study rather than unintended interactions elsewhere in the stack.
+\end{enumerate}
+
+These roadblocks do not invalidate the project. Instead, they explain why the current report emphasizes both results and methodology. The final stage of the project is not just ``run more experiments,'' but also ``stabilize the experimental platform enough that the stronger TCP-family variants can be tuned and compared cleanly on the target testbed.''
+
+\section{Conclusion}
+
+The current project status meets the intent of the progress-report milestone. The exploratory phase is effectively complete, and the implementation phase is mostly complete as well. We now have concrete saved evidence that basic DCTCP and DCTCP+TFO are insufficient in this workload, while stronger TCP-family designs such as pooling, HTTP/2-style multiplexing, staggered scheduling, and load-aware session assignment can sustain throughput comparable to or slightly above Homa. At the same time, Homa still appears to preserve a meaningful latency advantage, especially for short messages and slowdown behavior.
+
+If the project ended today, the defensible conclusion would be that tuned TCP can close part of the gap but has not yet eliminated Homa's core advantage. The final stage of the project is therefore to turn that interim conclusion into a cleaner and more complete final argument by tightening the strongest comparisons, fixing the remaining instrumentation caveats, and determining whether the final evidence validates the limited form of the hypothesis or rejects it more broadly.
+
+\begin{thebibliography}{9}
+
+\bibitem{homa-linux}
+John Ousterhout.
+\newblock \emph{A Linux Kernel Implementation of the Homa Transport Protocol}.
+\newblock In Proceedings of the 2021 USENIX Annual Technical Conference, 2021.
+
+\bibitem{replace-tcp}
+John Ousterhout.
+\newblock \emph{It's Time to Replace TCP in the Datacenter}.
+\newblock Communications of the ACM, 2022.
+
+\bibitem{hol}
+Michael Scharf and Sebastian Kiesel.
+\newblock \emph{Head-of-Line Blocking in TCP and SCTP: Analysis and Measurements}.
+\newblock In IEEE Global Telecommunications Conference, 2006.
+
+\bibitem{proposal}
+Xander Yoon, Shabib Ahmed, and Shreekrishna R. Bhat.
+\newblock \emph{DNS 8803 Project Proposal and Outline}.
+\newblock Course project documents, 2026.
+
+\end{thebibliography}
+
+\end{document}

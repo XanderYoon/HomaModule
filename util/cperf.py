@@ -67,6 +67,38 @@ log_file = 0
 # Indicates whether we should generate additional log messages for debugging
 verbose = False
 
+TCP_COUNTERS = [
+    "TcpRetransSegs",
+    "TcpExtTCPDelivered",
+    "TcpExtTCPDeliveredCE",
+    "TcpExtTCPFastRetrans",
+    "TcpExtTCPSlowStartRetrans",
+    "TcpExtTCPLostRetransmit",
+    "TcpExtTCPTimeouts",
+    "TcpExtTCPLossProbes",
+    "TcpExtTCPLossProbeRecovery",
+    "TcpExtTCPRcvQDrop",
+    "TcpExtTCPBacklogDrop",
+    "TcpExtTCPReqQFullDrop",
+    "TcpExtListenDrops",
+    "TcpExtListenOverflows",
+    "TcpExtTCPOFODrop",
+    "TcpExtTCPAbortOnData",
+    "TcpExtTCPAbortOnClose",
+    "TcpExtTCPAbortOnTimeout",
+    "TcpExtTCPRetransFail",
+    "TcpExtTCPFastOpenActive",
+    "TcpExtTCPFastOpenActiveFail",
+    "TcpExtTCPFastOpenPassive",
+    "TcpExtTCPFastOpenPassiveFail",
+    "TcpExtTCPFastOpenListenOverflow",
+    "TcpExtTCPFastOpenCookieReqd",
+    "TcpExtTCPFastOpenBlackhole",
+    "IpExtInECT0Pkts",
+    "IpExtInECT1Pkts",
+    "IpExtInCEPkts",
+]
+
 # Defaults for command-line options; assumes that servers and clients
 # share nodes.
 default_defaults = {
@@ -527,6 +559,138 @@ def do_ssh(command, nodes):
         subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id] + command,
                 stdout=subprocess.DEVNULL)
 
+def run_ssh_capture(command, nodes):
+    """
+    Run a command on each node and capture stdout.
+
+    command: command to execute on each node (a list of argument words)
+    nodes:   iterable of node ids
+    Returns: dictionary keyed by node id; each value is stdout text
+    """
+    results = {}
+    vlog("capturing ssh output on nodes %s: %s" % (str(nodes),
+            " ".join(command)))
+    for id in nodes:
+        result = subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id]
+                + command, capture_output=True, encoding="utf-8")
+        if result.returncode != 0:
+            raise Exception("command '%s' failed on node-%d: %s"
+                    % (" ".join(command), id, result.stderr.rstrip()))
+        results[id] = result.stdout
+    return results
+
+def parse_nstat_output(output):
+    """
+    Parse output from nstat into a dictionary of counter values.
+    """
+    counters = {}
+    for line in output.splitlines():
+        words = line.split()
+        if len(words) < 2:
+            continue
+        try:
+            counters[words[0]] = int(words[1])
+        except ValueError:
+            continue
+    return counters
+
+def collect_tcp_counters(nodes):
+    """
+    Collect selected TCP/IP counters on the specified nodes.
+    """
+    command = ["nstat", "-asz"] + TCP_COUNTERS
+    output = run_ssh_capture(command, nodes)
+    counters = {}
+    for id, text in output.items():
+        counters[id] = parse_nstat_output(text)
+        for name in TCP_COUNTERS:
+            if name not in counters[id]:
+                counters[id][name] = 0
+    return counters
+
+def diff_tcp_counters(before, after):
+    """
+    Compute deltas between two counter snapshots.
+    """
+    deltas = {}
+    for id, after_values in after.items():
+        before_values = before.get(id, {})
+        deltas[id] = {}
+        for name in TCP_COUNTERS:
+            deltas[id][name] = after_values.get(name, 0) \
+                    - before_values.get(name, 0)
+    return deltas
+
+def collect_qdisc_stats(nodes):
+    """
+    Collect raw tc qdisc statistics for the cluster-facing interface on each
+    node. The text is returned unparsed because formats vary across setups.
+    """
+    script = (
+        "iface=$(ip -o -4 addr show scope global | grep ' 10\\.' | "
+        "head -n1 | awk '{print $2}'); "
+        "if [[ -z \\\"$iface\\\" ]]; then exit 0; fi; "
+        "sudo tc -s qdisc show dev \"$iface\""
+    )
+    return run_ssh_capture(["bash", "-lc", script], nodes)
+
+def write_tcp_counter_reports(name, deltas, qdisc_stats):
+    """
+    Write per-node and aggregate TCP counter reports for an experiment.
+    """
+    report_path = "%s/reports/%s.tcp_counters" % (log_dir, name)
+    aggregate = {}
+    for counter in TCP_COUNTERS:
+        aggregate[counter] = 0
+    for node_counters in deltas.values():
+        for counter, value in node_counters.items():
+            aggregate[counter] += value
+
+    with open(report_path, "w") as f:
+        f.write("# TCP/IP counter deltas for %s experiment, run at %s\n"
+                % (name, date_time))
+        f.write("# Aggregate deltas across sampled nodes\n")
+        for counter in TCP_COUNTERS:
+            f.write("%-32s %12d\n" % (counter, aggregate[counter]))
+        for id in sorted(deltas.keys()):
+            f.write("\n# node-%d\n" % (id))
+            for counter in TCP_COUNTERS:
+                f.write("%-32s %12d\n" % (counter, deltas[id][counter]))
+
+    interesting = [
+        "TcpExtTCPDeliveredCE",
+        "IpExtInECT0Pkts",
+        "IpExtInCEPkts",
+        "TcpRetransSegs",
+        "TcpExtTCPLostRetransmit",
+        "TcpExtTCPFastRetrans",
+        "TcpExtTCPTimeouts",
+        "TcpExtTCPRcvQDrop",
+        "TcpExtTCPBacklogDrop",
+        "TcpExtTCPReqQFullDrop",
+        "TcpExtListenDrops",
+        "TcpExtListenOverflows",
+        "TcpExtTCPOFODrop",
+        "TcpExtTCPFastOpenActive",
+        "TcpExtTCPFastOpenPassive",
+        "TcpExtTCPFastOpenActiveFail",
+        "TcpExtTCPFastOpenPassiveFail",
+    ]
+    summary = []
+    for counter in interesting:
+        if aggregate[counter] != 0:
+            summary.append("%s=%d" % (counter, aggregate[counter]))
+    if summary:
+        log("TCP counters for %s: %s" % (name, ", ".join(summary)))
+    else:
+        log("TCP counters for %s: no nonzero deltas in tracked counters"
+                % (name))
+
+    for id in sorted(qdisc_stats.keys()):
+        qdisc_path = "%s/%s-%d.qdisc" % (log_dir, name, id)
+        with open(qdisc_path, "w") as f:
+            f.write(qdisc_stats[id])
+
 def reset_tcp_netem(nodes):
     """
     Remove any root netem qdisc from the default cluster-facing interface
@@ -711,6 +875,11 @@ def run_experiment(name, clients, options):
         nodes.append(id)
         vlog("Command for node-%d: %s" % (id, command))
     wait_output("% ", nodes, command, 40.0)
+    tcp_counter_before = None
+    tcp_qdisc_after = {}
+    all_tcp_nodes = sorted(set(list(server_nodes) + list(clients)))
+    if options.protocol != "homa":
+        tcp_counter_before = collect_tcp_counters(all_tcp_nodes)
     if not "unloaded" in options:
         if options.protocol == "homa":
             # Wait a bit so that homa_prio can set priorities appropriately
@@ -733,6 +902,12 @@ def run_experiment(name, clients, options):
         time.sleep(options.seconds - debug_delay)
         do_cmd("log Ending %s experiment" % (name), server_nodes, clients)
     log("Retrieving data for %s experiment" % (name))
+    if options.protocol != "homa":
+        tcp_counter_after = collect_tcp_counters(all_tcp_nodes)
+        tcp_qdisc_after = collect_qdisc_stats(all_tcp_nodes)
+        write_tcp_counter_reports(name,
+                diff_tcp_counters(tcp_counter_before, tcp_counter_after),
+                tcp_qdisc_after)
     if not "no_rtt_files" in options:
         do_cmd("dump_times rtts", clients)
     if options.protocol == "homa":
