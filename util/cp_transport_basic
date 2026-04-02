@@ -1,0 +1,250 @@
+#!/usr/bin/python3
+
+from cperf import *
+
+VARIANTS = [
+    {
+        "name": "dctcp",
+        "label": "DCTCP",
+        "tcp_fastopen": False,
+        "tcp_client_pooling": False,
+    },
+    {
+        "name": "dctcp_tfo",
+        "label": "DCTCP + TFO",
+        "tcp_fastopen": True,
+        "tcp_client_pooling": False,
+        "client_max": 32,
+    },
+    {
+        "name": "dctcp_tfo_pool",
+        "label": "DCTCP + TFO + Connection Pooling",
+        "tcp_fastopen": True,
+        "tcp_client_pooling": True,
+    },
+    {
+        "name": "dctcp_tfo_http2",
+        "label": "DCTCP + TFO + HTTP/2 Multiplexing",
+        "tcp_fastopen": True,
+        "tcp_client_pooling": True,
+        "tcp_http2": True,
+        "tcp_client_ports": 1,
+        "tcp_port_receivers": 2,
+    },
+    {
+        "name": "dctcp_tfo_staggered",
+        "label": "DCTCP + TFO + Staggered Scheduling",
+        "tcp_fastopen": True,
+        "tcp_client_pooling": True,
+        "tcp_stagger_us": 25,
+        "netem_loss_percent": 0.200,
+        "netem_ecn": True,
+    },
+    {
+        "name": "dctcp_tfo_load_aware",
+        "label": "DCTCP + TFO + Load-Aware Session Scheduling",
+        "tcp_fastopen": True,
+        "tcp_client_pooling": True,
+        "tcp_load_aware": True,
+    },
+]
+
+def maybe_metric(experiments, exp_name, field, transform=None, fmt="%.2f"):
+    if exp_name not in experiments:
+        return "n/a"
+    node = experiments[exp_name].get("node-0", {})
+    if field not in node or len(node[field]) == 0:
+        return "n/a"
+    values = node[field]
+    if transform:
+        values = [transform(v) for v in values]
+    return avg(values, fmt)
+
+def avg(values, fmt):
+    result = fmt % (sum(values)/float(len(values)))
+    result += " ("
+    for value in values:
+        if result[-1] != "(":
+            result += " "
+        result += fmt % (value)
+    result += ")"
+    return result
+
+def apply_variant_options(options, variant):
+    configured = copy.deepcopy(options)
+    for key, value in variant.items():
+        if key in ("name", "label", "netem_loss_percent", "netem_ecn"):
+            continue
+        setattr(configured, key, value)
+    return configured
+
+def configure_variant_environment(options, variant, all_nodes):
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", "dctcp",
+            all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_ecn", "1", all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_fastopen",
+            "3" if getattr(options, "tcp_fastopen", False) else "0",
+            all_nodes)
+    configure_tcp_netem(all_nodes,
+            loss_percent=variant.get("netem_loss_percent", 0.0),
+            ecn=variant.get("netem_ecn", False))
+
+def run_homa_suite(options):
+    start_servers(range(1, options.num_nodes), options)
+    o = copy.deepcopy(options)
+    o.client_ports = 1
+    o.port_receivers = 0
+    o.client_max = 1
+    o.server_nodes = 1
+    o.first_server = 1
+    o.server_ports = 1
+    o.workload = "100"
+    o.num_servers = 1
+    o.first_server = 1
+    run_experiment("homa_latency", range(0, 1), o)
+
+    o.workload = "500000"
+    run_experiment("homa_1msg_tput", range(0, 1), o)
+
+    o = copy.deepcopy(options)
+    o.workload = "100"
+    o.server_nodes = options.num_nodes-1
+    o.first_server = 1
+    run_experiment("homa_client_rpc_tput", range(0, 1), o)
+
+    o.workload = "500000"
+    o.client_max = 50
+    run_experiment("homa_client_tput", range(0, 1), o)
+
+    start_servers(range(0, 1), options)
+    o = copy.deepcopy(options)
+    o.workload = "100"
+    o.server_nodes = 1
+    o.first_server = 0
+    o.client_max = 10
+    run_experiment("homa_server_rpc_tput", range(1, options.num_nodes), o)
+
+    o.workload = "500000"
+    o.client_max = 5
+    run_experiment("homa_server_tput", range(1, options.num_nodes), o)
+
+def run_tcp_suite(options, variant):
+    all_nodes = range(0, options.num_nodes)
+    options = apply_variant_options(options, variant)
+    options.protocol = "tcp"
+    configure_variant_environment(options, variant, all_nodes)
+    prefix = variant["name"]
+
+    start_servers(range(1, options.num_nodes), options)
+    o = copy.deepcopy(options)
+    o.tcp_client_ports = 1
+    o.client_max = 1
+    o.server_nodes = 1
+    o.first_server = 1
+    o.tcp_server_ports = 1
+    o.workload = "100"
+    run_experiment("%s_latency" % prefix, range(0, 1), o)
+
+    o.workload = "500000"
+    run_experiment("%s_1msg_tput" % prefix, range(0, 1), o)
+
+    o = copy.deepcopy(options)
+    o.workload = "100"
+    o.server_nodes = options.num_nodes-1
+    o.first_server = 1
+    run_experiment("%s_client_rpc_tput" % prefix, range(0, 1), o)
+
+    o.workload = "500000"
+    o.client_max = 20
+    run_experiment("%s_client_tput" % prefix, range(0, 1), o)
+
+    start_servers(range(0, 1), options)
+    o = copy.deepcopy(options)
+    o.workload = "100"
+    o.server_nodes = 1
+    o.first_server = 0
+    o.client_max = 50
+    run_experiment("%s_server_rpc_tput" % prefix, range(1, options.num_nodes), o)
+
+    o.workload = "500000"
+    o.client_max = 5
+    run_experiment("%s_server_tput" % prefix, range(1, options.num_nodes), o)
+
+parser = get_parser(description=
+        'Measures Homa versus DCTCP variants including TFO, pooling, '
+        'HTTP/2-style multiplexing, staggered starts, and load-aware scheduling.',
+        usage='%(prog)s [options]',
+        defaults={
+            "client_ports":     9,
+            "port_receivers":   1,
+            "server_ports":     6,
+            "port_threads":     3,
+            "tcp_client_ports": 9,
+            "tcp_server_ports": 16})
+options = parser.parse_args()
+options.no_rtt_files = True
+init(options)
+if options.num_nodes < 2:
+    print("--num_nodes too small (%d): must be at least 2" % (options.num_nodes))
+    sys.exit(-1)
+
+congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
+tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
+tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
+
+if not options.plot_only:
+    run_homa_suite(options)
+    for variant in VARIANTS:
+        run_tcp_suite(options, variant)
+
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn, range(0, options.num_nodes))
+    reset_tcp_netem(range(0, options.num_nodes))
+    log("Stopping nodes")
+    stop_nodes()
+
+experiments = {}
+scan_log(options.log_dir + "/node-0.log", "node-0", experiments)
+
+node = experiments["homa_latency"]["node-0"]
+log("Homa RTT latency (us): %s" % (avg(node["client_latency"], "%.2f")))
+node = experiments["homa_1msg_tput"]["node-0"]
+log("Homa single message throughput (Gbps): %s"
+        % (avg([2*m for m in node["client_gbps"]], "%.2f")))
+node = experiments["homa_client_rpc_tput"]["node-0"]
+log("Homa client RPC throughput (Kops/sec): %s"
+        % (avg(node["client_kops"], "%.2f")))
+node = experiments["homa_server_rpc_tput"]["node-0"]
+log("Homa server RPC throughput (Kops/sec): %s"
+        % (avg(node["server_kops"], "%.2f")))
+node = experiments["homa_client_tput"]["node-0"]
+log("Homa client throughput (Gbps): %s"
+        % (avg(node["client_gbps"], "%.2f")))
+node = experiments["homa_server_tput"]["node-0"]
+log("Homa server throughput (Gbps): %s"
+        % (avg(node["server_gbps"], "%.2f")))
+
+for variant in VARIANTS:
+    prefix = variant["name"]
+    label = variant["label"]
+    log("\n%s RTT latency (us): %s" % (
+            label, maybe_metric(experiments, "%s_latency" % prefix,
+            "client_latency", fmt="%.2f")))
+    log("%s single message throughput (Gbps): %s" % (
+            label, maybe_metric(experiments, "%s_1msg_tput" % prefix,
+            "client_gbps", transform=lambda v: 2*v, fmt="%.2f")))
+    log("%s client RPC throughput (Kops/sec): %s" % (
+            label, maybe_metric(experiments, "%s_client_rpc_tput" % prefix,
+            "client_kops", fmt="%.2f")))
+    log("%s server RPC throughput (Kops/sec): %s" % (
+            label, maybe_metric(experiments, "%s_server_rpc_tput" % prefix,
+            "server_kops", fmt="%.2f")))
+    log("%s client throughput (Gbps): %s" % (
+            label, maybe_metric(experiments, "%s_client_tput" % prefix,
+            "client_gbps", fmt="%.2f")))
+    log("%s server throughput (Gbps): %s" % (
+            label, maybe_metric(experiments, "%s_server_tput" % prefix,
+            "server_gbps", fmt="%.2f")))

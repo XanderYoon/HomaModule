@@ -84,8 +84,13 @@ default_defaults = {
     'seconds':             5,
     'server_ports':        3,
     'tcp_client_ports':    4,
+    'tcp_fastopen':        False,
+    'tcp_http2':           False,
+    'tcp_client_pooling':  True,
+    'tcp_load_aware':      False,
     'tcp_port_receivers':  1,
     'tcp_server_ports':    8,
+    'tcp_stagger_us':      0,
     'tcp_port_threads':    1,
     'unloaded':            0,
     'unsched':             0,
@@ -258,11 +263,33 @@ def get_parser(description, usage, defaults = {}):
             metavar='count', default=defaults['tcp_client_ports'],
             help='Number of ports on which each TCP client should issue requests '
             '(default: %d)'% (defaults['tcp_client_ports']))
+    parser.add_argument('--tcp-fastopen', dest='tcp_fastopen', type=boolean,
+            default=defaults['tcp_fastopen'],
+            help='Enable TCP Fast Open for TCP-based experiments '
+            '(default: false)')
+    parser.add_argument('--tcp-http2', dest='tcp_http2', type=boolean,
+            default=defaults['tcp_http2'],
+            help='Approximate an HTTP/2-style single multiplexed TCP session '
+            'per server by reusing one shared connection per client port '
+            '(default: false)')
+    parser.add_argument('--tcp-client-pooling', dest='tcp_client_pooling',
+            type=boolean, default=defaults['tcp_client_pooling'],
+            help='Reuse established TCP client connections across RPCs '
+            '(default: true)')
+    parser.add_argument('--tcp-load-aware', dest='tcp_load_aware',
+            type=boolean, default=defaults['tcp_load_aware'],
+            help='Choose the least-backed-up TCP session for each new RPC '
+            '(default: false)')
     parser.add_argument('--tcp-port-receivers', type=int,
             dest='tcp_port_receivers', metavar='count',
             default=defaults['tcp_port_receivers'],
             help='Number of threads listening for responses on each TCP client '
             'port (default: %d)'% (defaults['tcp_port_receivers']))
+    parser.add_argument('--tcp-stagger-us', type=int, dest='tcp_stagger_us',
+            metavar='usec', default=defaults['tcp_stagger_us'],
+            help='Delay the initial TCP client start for each node/port by a '
+            'multiple of this many microseconds (default: %d)'
+            % (defaults['tcp_stagger_us']))
     parser.add_argument('--tcp-port-threads', type=int, dest='tcp_port_threads',
             metavar='count', default=defaults['tcp_port_threads'],
             help='Number of threads listening on each TCP server port '
@@ -500,6 +527,43 @@ def do_ssh(command, nodes):
         subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id] + command,
                 stdout=subprocess.DEVNULL)
 
+def reset_tcp_netem(nodes):
+    """
+    Remove any root netem qdisc from the default cluster-facing interface
+    on the specified nodes.
+    """
+    script = (
+        "iface=$(ip -o -4 addr show scope global | grep ' 10\\.' | "
+        "head -n1 | awk '{print $2}'); "
+        "if [[ -n \\\"$iface\\\" ]]; then "
+        "sudo tc qdisc del dev \\\"$iface\\\" root >/dev/null 2>&1 || true; "
+        "fi"
+    )
+    do_ssh(["bash", "-lc", script], nodes)
+
+def configure_tcp_netem(nodes, loss_percent=0.0, ecn=False):
+    """
+    Configure a root netem qdisc for the default cluster-facing interface on
+    the specified nodes. The qdisc is replaced if it already exists.
+    """
+    reset_tcp_netem(nodes)
+    if (loss_percent <= 0.0) and (not ecn):
+        return
+    command = "sudo tc qdisc replace dev \"$iface\" root netem"
+    if loss_percent > 0.0:
+        command += " loss %.3f%%" % (loss_percent)
+    if ecn:
+        command += " ecn"
+    script = (
+        "iface=$(ip -o -4 addr show scope global | grep ' 10\\.' | "
+        "head -n1 | awk '{print $2}'); "
+        "if [[ -z \\\"$iface\\\" ]]; then "
+        "echo missing cluster interface >&2; exit 1; "
+        "fi; "
+        "%s" % (command)
+    )
+    do_ssh(["bash", "-lc", script], nodes)
+
 def get_sysctl_parameter(name):
     """
     Retrieve the value of a particular system parameter using sysctl on
@@ -551,9 +615,12 @@ def start_servers(r, options):
                 options.server_ports, options.port_threads,
                 options.protocol), r)
     else:
-        do_cmd("server --ports %d --port-threads %d --protocol %s" % (
+        command = "server --ports %d --port-threads %d --protocol %s" % (
                 options.tcp_server_ports, options.tcp_port_threads,
-                options.protocol), r)
+                options.protocol)
+        if getattr(options, "tcp_fastopen", False):
+            command += " --tcp-fastopen"
+        do_cmd(command, r)
     server_nodes = r
 
 def run_experiment(name, clients, options):
@@ -627,6 +694,15 @@ def run_experiment(name, clients, options):
                     options.client_max,
                     options.protocol,
                     id);
+            if getattr(options, "tcp_fastopen", False):
+                command += " --tcp-fastopen"
+            if getattr(options, "tcp_load_aware", False):
+                command += " --tcp-load-aware"
+            if not getattr(options, "tcp_client_pooling", True):
+                command += " --tcp-no-pooling"
+            stagger_us = getattr(options, "tcp_stagger_us", 0)
+            if stagger_us > 0:
+                command += " --tcp-stagger-us %d" % (stagger_us)
         active_nodes[id].stdin.write(command + "\n")
         try:
             active_nodes[id].stdin.flush()
@@ -840,18 +916,31 @@ def scan_logs():
                 vlog("%s average: %.1f Kops/sec"
                         % (type.capitalize(), totals[kops_key]/len(averages)))
 
-        log("\nClients for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
-                "(avg per node)" % (name, len(nodes["client"]),
-                totals["client_gbps"]/len(nodes["client"]),
-                totals["client_kops"]/len(nodes["client"])))
-        log("Servers for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
-                "(avg per node)" % (name, len(nodes["server"]),
-                totals["server_gbps"]/len(nodes["server"]),
-                totals["server_kops"]/len(nodes["server"])))
-        log("Overall for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
-                "(avg per node)" % (name, len(nodes["all"]),
-                (totals["client_gbps"] + totals["server_gbps"])/len(nodes["all"]),
-                (totals["client_kops"] + totals["server_kops"])/len(nodes["all"])))
+        if (len(nodes["client"]) > 0) and ("client_gbps" in totals) \
+                and ("client_kops" in totals):
+            log("\nClients for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
+                    "(avg per node)" % (name, len(nodes["client"]),
+                    totals["client_gbps"]/len(nodes["client"]),
+                    totals["client_kops"]/len(nodes["client"])))
+        else:
+            log("\nClients for %s experiment: n/a" % (name))
+        if (len(nodes["server"]) > 0) and ("server_gbps" in totals) \
+                and ("server_kops" in totals):
+            log("Servers for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
+                    "(avg per node)" % (name, len(nodes["server"]),
+                    totals["server_gbps"]/len(nodes["server"]),
+                    totals["server_kops"]/len(nodes["server"])))
+        else:
+            log("Servers for %s experiment: n/a" % (name))
+        if (len(nodes["all"]) > 0) and ("client_gbps" in totals) \
+                and ("server_gbps" in totals) and ("client_kops" in totals) \
+                and ("server_kops" in totals):
+            log("Overall for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
+                    "(avg per node)" % (name, len(nodes["all"]),
+                    (totals["client_gbps"] + totals["server_gbps"])/len(nodes["all"]),
+                    (totals["client_kops"] + totals["server_kops"])/len(nodes["all"])))
+        else:
+            log("Overall for %s experiment: n/a" % (name))
 
         for node in sorted(exp.keys()):
             if "outstanding_rpcs" in exp[node]:
@@ -916,9 +1005,19 @@ def get_buckets(rtts, total):
     """
     buckets = []
     cumulative = 0
-    for length in sorted(rtts.keys()):
-        cumulative += len(rtts[length])
-        buckets.append([length, cumulative/total])
+    bucket_samples = 0
+    # Merge adjacent message sizes until each bucket has a useful
+    # number of samples; exact-length buckets are too noisy for slow
+    # TCP variants such as non-pooled DCTCP/TFO at w4.
+    min_bucket_samples = min(500, max(25, total//40))
+    lengths = sorted(rtts.keys())
+    for i, length in enumerate(lengths):
+        count = len(rtts[length])
+        cumulative += count
+        bucket_samples += count
+        if (bucket_samples >= min_bucket_samples) or (i == (len(lengths) - 1)):
+            buckets.append([length, cumulative/total])
+            bucket_samples = 0
     return buckets
 
 def set_unloaded(experiment):
@@ -979,12 +1078,35 @@ def get_digest(experiment):
         sys.stdout.write("#")
         sys.stdout.flush()
     print("")
+
+    report_path = "%s/reports/%s.data" % (log_dir, experiment)
+    def write_empty_digest(reason):
+        f = open(report_path, "w")
+        f.write("# Digested data for %s experiment, run at %s\n"
+                % (experiment, date_time))
+        f.write("# %s\n" % (reason))
+        f.write("# length  cum_frac  samples     p50      p99     p999   "
+                "s50    s99    s999\n")
+        f.close()
+
+    if digest["total_messages"] == 0:
+        log("WARNING: no RTT samples found for %s; leaving digest empty"
+                % (experiment))
+        write_empty_digest("No RTT samples were available for this experiment")
+        digests[experiment] = digest
+        return digest
     
     if len(unloaded_p50) == 0:
         raise Exception("No unloaded data: must invoked set_unloaded")
 
     rtts = digest["rtts"]
     buckets = get_buckets(rtts, digest["total_messages"])
+    if len(buckets) == 0:
+        log("WARNING: no histogram buckets generated for %s; leaving digest "
+                "empty" % (experiment))
+        write_empty_digest("No histogram buckets could be generated for this experiment")
+        digests[experiment] = digest
+        return digest
     bucket_length, bucket_cum_frac = buckets[0]
     next_bucket = 1
     bucket_rtts = []
@@ -1025,7 +1147,7 @@ def get_digest(experiment):
     log("Digest finished for %s" % (experiment))
 
     dir = "%s/reports" % (log_dir)
-    f = open("%s/reports/%s.data" % (log_dir, experiment), "w")
+    f = open(report_path, "w")
     f.write("# Digested data for %s experiment, run at %s\n"
             % (experiment, date_time))
     f.write("# length  cum_frac  samples     p50      p99     p999   "
@@ -1206,6 +1328,8 @@ def plot_slowdown(ax, experiment, percentile, label, **kwargs):
     """
 
     digest = get_digest(experiment)
+    if len(digest["cum_frac"]) == 0:
+        return
     if percentile == "p50":
         x, y = make_histogram(digest["cum_frac"], digest["slow_50"],
                 init=[0, digest["slow_50"][0]], after=False)
@@ -1295,6 +1419,8 @@ def get_short_cdf(experiment):
     short = []
     digest = get_digest(experiment)
     rtts = digest["rtts"]
+    if digest["total_messages"] == 0:
+        return [[], []]
     messages_left = digest["total_messages"]//10
     longest = 0
     for length in sorted(rtts.keys()):
@@ -1310,6 +1436,14 @@ def get_short_cdf(experiment):
     x = []
     y = []
     total = len(short)
+    if total == 0:
+        f = open("%s/reports/%s_cdf.data" % (log_dir, experiment), "w")
+        f.write("# Fraction of RTTS longer than a given time for %s experiment\n"
+                % (experiment))
+        f.write("# No short-message RTT samples were available at %s \n"
+                % (date_time))
+        f.close()
+        return [[], []]
     remaining = total
     f = open("%s/reports/%s_cdf.data" % (log_dir, experiment), "w")
     f.write("# Fraction of RTTS longer than a given time for %s experiment\n"

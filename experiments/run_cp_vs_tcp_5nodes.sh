@@ -10,9 +10,15 @@ REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
 NUM_NODES="${NUM_NODES:-5}"
 RUN_SECONDS="${RUN_SECONDS:-10}"
+LINK_MBPS="${LINK_MBPS:-25000}"
+HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
+HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
+HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
+HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR_DEFAULT="$REPO_ROOT/experiments/results"
 LOCAL_RESULTS_DIR="$LOCAL_RESULTS_DIR_DEFAULT"
+RESULTS_RUN_ROOT=""
 WORKLOAD=""
 GBPS=""
 TCP="false"
@@ -30,6 +36,7 @@ Optional:
   --seconds S           Duration of each experiment phase (default: 10)
   --tcp BOOL            Run the regular TCP comparison too (default: false)
   --dctcp BOOL          Run the DCTCP comparison (default: true)
+  --link-mbps M         Homa link rate to configure on each node (default: 25000)
   --log-root DIR        Parent directory for cp_vs_tcp logs (default: logs)
   --start-script NAME   Remote module start script, or 'generic'
                         (default: generic)
@@ -40,7 +47,7 @@ Optional:
 
 Environment overrides:
   CLOUDLAB_USER, REMOTE_REPO_DIR, REMOTE_COMPAT_REPO_LINK,
-  START_SCRIPT, NUM_NODES, RUN_SECONDS, LOG_ROOT, NODE0_ALIAS
+  START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS
 
 Notes:
   - Run ssh_setup_5nodes.sh first so node aliases and key-based SSH are configured.
@@ -86,6 +93,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dctcp)
             DCTCP="$2"
+            shift 2
+            ;;
+        --link-mbps)
+            LINK_MBPS="$2"
             shift 2
             ;;
         --log-root)
@@ -137,7 +148,9 @@ require_cmd date
 
 STAMP="$(date +%Y%m%d%H%M%S)"
 LOG_DIR="$LOG_ROOT/cp_vs_tcp_${WORKLOAD}_${STAMP}"
-mkdir -p "$LOCAL_RESULTS_DIR"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline"
+LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
+mkdir -p "$RESULTS_RUN_ROOT"
 HOSTS_FILE="$REPO_ROOT/ssh_setup/hosts_5.txt"
 
 if [[ ! -f "$HOSTS_FILE" ]]; then
@@ -173,17 +186,41 @@ ssh "$NODE0_ALIAS" "
     make -j
     make -C util -j
     cp cloudlab/bin/* ~/bin/
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/*.py ~/bin/
     chmod +x ~/bin/*
     cp cloudlab/bashrc ~/.bashrc
     cp cloudlab/bash_profile ~/.bash_profile
 "
 
-log setup "Copying runtime files to node-0 through node-9 and loading Homa with $START_SCRIPT"
-ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$START_SCRIPT" "$NUM_NODES" <<'EOF'
+log setup "Authorizing node0 SSH key on node1 through node4"
+NODE0_PUBKEY="$(ssh "$NODE0_ALIAS" "cat ~/.ssh/id_ed25519.pub")"
+for i in $(seq 1 $((NUM_NODES-1))); do
+    ssh "node$i" "
+        set -euo pipefail
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        grep -qxF '$NODE0_PUBKEY' ~/.ssh/authorized_keys 2>/dev/null || \
+            printf '%s\n' '$NODE0_PUBKEY' >> ~/.ssh/authorized_keys
+    "
+done
+
+log setup "Copying runtime files to node-0 through node-4 and loading Homa with $START_SCRIPT"
+ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$START_SCRIPT" "$NUM_NODES" \
+    "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" "$HOMA_RTT_BYTES" \
+    "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
 set -euo pipefail
 remote_repo_dir="$1"
 start_script="$2"
 num_nodes="$3"
+link_mbps_override="$4"
+max_nic_queue_ns_override="$5"
+rtt_bytes_override="$6"
+grant_increment_override="$7"
+max_gso_size_override="$8"
 node0_pubkey="$(cat ~/.ssh/id_ed25519.pub)"
 private_ip_pattern='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
 
@@ -207,11 +244,19 @@ for i in $(seq 0 $((num_nodes-1))); do
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
         homa.ko util/cp_node util/homa_prio util/*.py "$node:bin/"
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv /tmp/homa_node_hosts "$node:/tmp/homa_node_hosts"
+    ssh "$node" "sudo /usr/bin/install -m 755 ~/bin/cp_node /usr/bin/cp_node && sudo /usr/bin/install -m 755 ~/bin/homa_prio /usr/bin/homa_prio && sudo /usr/bin/install -m 755 ~/bin/*.py /usr/bin/"
     ssh "$node" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qxF '$node0_pubkey' ~/.ssh/authorized_keys 2>/dev/null || printf '%s\n' '$node0_pubkey' >> ~/.ssh/authorized_keys"
     ssh "$node" "sudo sed -i '/ node-[0-9]\\b/d;/ node[0-9]\\b/d' /etc/hosts && cat /tmp/homa_node_hosts | sudo tee -a /etc/hosts >/dev/null"
     if [[ "$start_script" == "generic" ]]; then
-        ssh "$node" bash -s <<'INNER'
+        ssh "$node" bash -s -- "$link_mbps_override" "$max_nic_queue_ns_override" \
+            "$rtt_bytes_override" "$grant_increment_override" \
+            "$max_gso_size_override" <<'INNER'
 set -eu
+link_mbps="$1"
+max_nic_queue_ns="$2"
+rtt_bytes="$3"
+grant_increment="$4"
+max_gso_size="$5"
 iface=$(ip -o -4 addr show scope global | awk '$4 ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/ {print $2; exit}')
 if [[ -z "$iface" ]]; then
     echo "Couldn't determine private interface for Homa setup" >&2
@@ -219,11 +264,11 @@ if [[ -z "$iface" ]]; then
 fi
 sudo rmmod homa >/dev/null 2>&1 || true
 sudo insmod ~/bin/homa.ko
-sudo sysctl -w net.homa.link_mbps=9500
-sudo sysctl -w net.homa.max_nic_queue_ns=10000
-sudo sysctl -w net.homa.rtt_bytes=70000
-sudo sysctl -w net.homa.grant_increment=10000
-sudo sysctl -w net.homa.max_gso_size=20000
+sudo sysctl -w net.homa.link_mbps="$link_mbps"
+sudo sysctl -w net.homa.max_nic_queue_ns="$max_nic_queue_ns"
+sudo sysctl -w net.homa.rtt_bytes="$rtt_bytes"
+sudo sysctl -w net.homa.grant_increment="$grant_increment"
+sudo sysctl -w net.homa.max_gso_size="$max_gso_size"
 if command -v cpupower >/dev/null 2>&1; then
     sudo cpupower frequency-set -g performance >/dev/null 2>&1 || true
 fi
@@ -248,6 +293,31 @@ INNER
 done
 EOF
 
+log setup "Refreshing Homa runtime on node-0 through node-4 before cp_vs_tcp"
+ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" \
+    "$HOMA_RTT_BYTES" "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
+set -euo pipefail
+num_nodes="$1"
+link_mbps="$2"
+max_nic_queue_ns="$3"
+rtt_bytes="$4"
+grant_increment="$5"
+max_gso_size="$6"
+for i in $(seq 0 $((num_nodes-1))); do
+    ssh "node-$i" "
+        sudo pkill cp_node >/dev/null 2>&1 || true
+        sudo pkill homa_prio >/dev/null 2>&1 || true
+        sudo rmmod homa >/dev/null 2>&1 || true
+        sudo insmod ~/bin/homa.ko
+        sudo sysctl -w net.homa.link_mbps=$link_mbps \
+            net.homa.max_nic_queue_ns=$max_nic_queue_ns \
+            net.homa.rtt_bytes=$rtt_bytes \
+            net.homa.grant_increment=$grant_increment \
+            net.homa.max_gso_size=$max_gso_size >/dev/null
+    "
+done
+EOF
+
 CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers 1 --tcp $TCP --dctcp $DCTCP -w $WORKLOAD -s $RUN_SECONDS -l $LOG_DIR"
 if [[ -n "$GBPS" ]]; then
     CP_VS_TCP_CMD+=" -b $GBPS"
@@ -256,8 +326,9 @@ fi
 log run "Launching cp_vs_tcp on $NODE0_ALIAS"
 ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && $CP_VS_TCP_CMD'"
 
-log fetch "Copying results back to $LOCAL_RESULTS_DIR"
+log fetch "Copying results back to $LOCAL_RUN_DIR"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
-    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_RESULTS_DIR/"
+    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_RUN_DIR/"
+ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest"
 
-log done "Benchmark complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RESULTS_DIR/$(basename "$LOG_DIR")"
+log done "Benchmark complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RUN_DIR"

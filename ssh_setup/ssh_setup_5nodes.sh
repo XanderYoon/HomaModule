@@ -172,8 +172,8 @@ setup_homa_on_node0() {
         make clean
         make
         mkdir -p ~/bin
-        install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
-        install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
+        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
+        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
     "
 }
 

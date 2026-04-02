@@ -69,6 +69,11 @@ bool is_server = false;
 int id = -1;
 double net_gbps = 0.0;
 bool tcp_trunc = true;
+bool tcp_fastopen = false;
+bool tcp_http2 = false;
+bool tcp_client_pooling = true;
+bool tcp_load_aware = false;
+int tcp_stagger_us = 0;
 int port_receivers = 1;
 int port_threads = 1;
 std::string protocol_string;
@@ -277,6 +282,11 @@ void print_help(const char *name)
 		"    --port-receivers  Number of threads to listen for responses on each\n"
 		"                      port (default: %d)\n"
 		"    --protocol        Transport protocol to use: homa or tcp (default: %s)\n"
+		"    --tcp-http2       Approximate an HTTP/2-style multiplexed session by\n"
+		"                      reusing one shared TCP connection per server\n"
+		"    --tcp-load-aware  Prefer the least-backed-up TCP session for new RPCs\n"
+		"    --tcp-stagger-us  Delay each client start by a multiple of this many\n"
+		"                      microseconds based on node and port id\n"
 		"    --server-nodes    Number of nodes running server threads (default: %d)\n"
 		"    --server-ports    Number of server ports on each server node\n"
 		"                      (default: %d)\n"
@@ -1123,6 +1133,17 @@ tcp_server::tcp_server(int port, int id, int num_threads)
 				"socket: %s",
 				strerror(errno));
 		exit(1);
+	}
+	if (tcp_fastopen) {
+#ifdef TCP_FASTOPEN
+		if (setsockopt(listen_fd, IPPROTO_TCP, TCP_FASTOPEN, &option_value,
+				sizeof(option_value)) != 0) {
+			log(NORMAL, "WARNING: couldn't enable TCP_FASTOPEN on "
+					"listen socket: %s\n", strerror(errno));
+		}
+#else
+		log(NORMAL, "WARNING: TCP_FASTOPEN not supported by headers\n");
+#endif
 	}
 	struct sockaddr_in addr;
 	addr.sin_family = AF_INET;
@@ -2114,6 +2135,12 @@ class tcp_client : public client {
     public:
 	tcp_client(int id);
 	virtual ~tcp_client();
+	int connect_server(int server, bool add_epoll);
+	int choose_server();
+	void close_connection(size_t index);
+	void send_request(int server, message_header *header, int pid,
+			size_t *max_pending);
+	void unblock_connection(tcp_connection *connection);
 	void read(tcp_connection *connection, int pid);
 	void receiver(int id);
 	void sender(void);
@@ -2138,6 +2165,9 @@ class tcp_client : public client {
 	 *  @requests: total number of message bytes received from each server.
 	 */
 	std::atomic<uint64_t> *bytes_rcvd;
+
+	/** @connection_server: maps each connection slot to its server index. */
+	std::vector<int> connection_server;
 	
 	/**
 	 * @backups: total number of times that a stream was congested
@@ -2165,6 +2195,13 @@ class tcp_client : public client {
 	
 	/** @receiver: threads that receive responses. */
 	std::vector<std::thread> receiving_threads;
+
+	/**
+	 * @connection_mutex: serializes access to @connections and @blocked for
+	 * non-pooled TCP, where sender and receiver threads create, remove, and
+	 * reuse connection slots concurrently.
+	 */
+	std::recursive_mutex connection_mutex;
 	
 	/**
 	 * @sender: thread that sends requests (may also receive
@@ -2184,6 +2221,7 @@ tcp_client::tcp_client(int id)
         , blocked()
         , bytes_sent()
         , bytes_rcvd(NULL)
+        , connection_server()
         , backups(0)
         , epoll_fd(-1)
 	, epollet((port_receivers > 1) ? EPOLLET : 0)
@@ -2204,43 +2242,10 @@ tcp_client::tcp_client(int id)
 	}
 	
 	for (uint32_t i = 0; i < server_addrs.size(); i++) {
-		int fd = socket(PF_INET, SOCK_STREAM, 0);
-		if (fd == -1) {
-			log(NORMAL, "FATAL: couldn't open TCP client "
-					"socket: %s\n",
-					strerror(errno));
-			exit(1);
-		}
-		if (connect(fd, reinterpret_cast<struct sockaddr *>(
-				&server_addrs[i]),
-				sizeof(server_addrs[i])) == -1) {
-			log(NORMAL, "FATAL: client couldn't connect "
-					"to %s: %s\n",
-					print_address(&server_addrs[i]),
-					strerror(errno));
-			exit(1);
-		}
-		int flag = 1;
-		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-		if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
-			log(NORMAL, "FATAL: couldn't set O_NONBLOCK on socket "
-					"to server %s: %s",
-					print_address(&server_addrs[i]),
-					strerror(errno));
-			exit(1);
-		}
-		struct sockaddr_in addr;
-		socklen_t length = sizeof(addr);
-		if (getsockname(fd, reinterpret_cast<struct sockaddr *>(&addr),
-				&length)) {
-			log(NORMAL, "FATAL: getsockname failed for TCP client: "
-					"%s\n", strerror(errno));
-			exit(1);
-		}
-		connections.emplace_back(new tcp_connection(fd, i,
-				ntohs(addr.sin_port), server_addrs[i]));
-		connections[connections.size()-1]->set_epoll_events(epoll_fd,
-				EPOLLIN|epollet);
+		connections.emplace_back(nullptr);
+		connection_server.push_back(i);
+		if (tcp_client_pooling && !tcp_fastopen)
+			connect_server(i, true);
 	}
 	
 	for (int i = 0; i < port_receivers; i++) {
@@ -2292,10 +2297,149 @@ tcp_client::~tcp_client()
 	close(fds[1]);
 	close(epoll_fd);
 	for (tcp_connection *connection: connections) {
+		if (connection == NULL)
+			continue;
 		close(connection->fd);
 		delete connection;
 	}
 	delete[] bytes_rcvd;
+}
+
+int tcp_client::connect_server(int server, bool add_epoll)
+{
+	int fd = socket(PF_INET, SOCK_STREAM, 0);
+	if (fd == -1) {
+		log(NORMAL, "FATAL: couldn't open TCP client socket: %s\n",
+				strerror(errno));
+		exit(1);
+	}
+	int flag = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#ifdef TCP_FASTOPEN_CONNECT
+	if (tcp_fastopen) {
+		if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &flag,
+				sizeof(flag)) != 0) {
+			log(NORMAL, "WARNING: couldn't enable TCP_FASTOPEN_CONNECT "
+					"for %s: %s\n",
+					print_address(&server_addrs[server]),
+					strerror(errno));
+		}
+	}
+#endif
+	if (connect(fd, reinterpret_cast<struct sockaddr *>(
+			&server_addrs[server]), sizeof(server_addrs[server])) == -1) {
+		log(NORMAL, "FATAL: client couldn't connect to %s: %s\n",
+				print_address(&server_addrs[server]),
+				strerror(errno));
+		exit(1);
+	}
+	if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
+		log(NORMAL, "FATAL: couldn't set O_NONBLOCK on socket to server %s: %s",
+				print_address(&server_addrs[server]), strerror(errno));
+		exit(1);
+	}
+	struct sockaddr_in addr;
+	socklen_t length = sizeof(addr);
+	if (getsockname(fd, reinterpret_cast<struct sockaddr *>(&addr), &length)) {
+		log(NORMAL, "FATAL: getsockname failed for TCP client: %s\n",
+				strerror(errno));
+		exit(1);
+	}
+	int slot;
+	if (tcp_client_pooling) {
+		slot = server;
+		if (connections[slot] != NULL)
+			close_connection(slot);
+	} else {
+		slot = -1;
+		for (size_t i = server_addrs.size(); i < connections.size(); i++) {
+			if (connections[i] == NULL) {
+				slot = i;
+				connection_server[i] = server;
+				break;
+			}
+		}
+		if (slot < 0) {
+			slot = connections.size();
+			connections.emplace_back(nullptr);
+			connection_server.push_back(server);
+		}
+	}
+	connections[slot] = new tcp_connection(fd, slot, ntohs(addr.sin_port),
+			server_addrs[server]);
+	if (add_epoll)
+		connections[slot]->set_epoll_events(epoll_fd, EPOLLIN|epollet);
+	return slot;
+}
+
+void tcp_client::close_connection(size_t index)
+{
+	tcp_connection *connection = connections[index];
+	if (connection == NULL)
+		return;
+	unblock_connection(connection);
+	if (connection->epoll_events != 0)
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->fd, NULL);
+	close(connection->fd);
+	delete connection;
+	connections[index] = NULL;
+}
+
+void tcp_client::unblock_connection(tcp_connection *connection)
+{
+	blocked.erase(std::remove(blocked.begin(), blocked.end(), connection),
+			blocked.end());
+}
+
+void tcp_client::send_request(int server, message_header *header, int pid,
+		size_t *max_pending)
+{
+	std::lock_guard<std::recursive_mutex> lock(connection_mutex);
+	int slot = server;
+	if (tcp_client_pooling && (connections[server] == NULL))
+		connect_server(server, true);
+	if (!tcp_client_pooling)
+		slot = connect_server(server, false);
+	tcp_connection *connection = connections[slot];
+	size_t old_pending = connection->pending();
+	tt("Sending TCP request, cid 0x%08x, id %u, length %d, pid %d",
+			header->cid, header->msg_id, header->length, pid);
+	if ((!connection->send_message(header)) && (old_pending == 0)) {
+		blocked.push_back(connection);
+		if (connection->pending() > *max_pending) {
+			*max_pending = connection->pending();
+			log(NORMAL, "max_pending now %lu for tcp_client %d\n",
+					*max_pending, id);
+		}
+	}
+	if (connection->pending() > 0)
+		connection->set_epoll_events(epoll_fd, EPOLLIN|EPOLLOUT|epollet);
+	else
+		connection->set_epoll_events(epoll_fd, EPOLLIN|epollet);
+}
+
+int tcp_client::choose_server()
+{
+	if (!tcp_load_aware) {
+		int server = request_servers[next_server];
+		next_server++;
+		if (next_server >= request_servers.size())
+			next_server = 0;
+		return server;
+	}
+	uint64_t best_backlog = ~0ull;
+	int best_server = -1;
+	size_t start = next_server;
+	for (size_t offset = 0; offset < num_servers; offset++) {
+		size_t index = (start + offset) % num_servers;
+		uint64_t backlog = bytes_sent[index] - bytes_rcvd[index];
+		if ((best_server < 0) || (backlog < best_backlog)) {
+			best_server = static_cast<int>(index);
+			best_backlog = backlog;
+		}
+	}
+	next_server = (best_server + 1) % num_servers;
+	return best_server;
 }
 
 /**
@@ -2313,6 +2457,12 @@ void tcp_client::sender()
 	uint64_t next_start = rdtsc();
 	message_header header;
 	size_t max_pending = 1;
+	if (tcp_stagger_us > 0) {
+		uint64_t cycles_per_us = get_cycles_per_sec()/1000000;
+		uint64_t stagger_units = static_cast<uint64_t>(::id)*client_ports + id;
+		next_start += stagger_units*static_cast<uint64_t>(tcp_stagger_us)
+				* cycles_per_us;
+	}
 	
 	/* Index of the next connection in blocked on which to try sending. */
 	size_t next_blocked = 0;
@@ -2337,21 +2487,24 @@ void tcp_client::sender()
 				break;
 			
 			/* Try to finish I/O on backed up connections. */
-			if (blocked.size() == 0)
-				continue;
-			if (next_blocked >= blocked.size())
-				next_blocked = 0;
-			if (blocked[next_blocked]->xmit())
-				blocked.erase(blocked.begin() + next_blocked);
-			else
-				next_blocked++;
+			{
+				std::lock_guard<std::recursive_mutex> lock(
+						connection_mutex);
+				if (blocked.size() == 0)
+					continue;
+				if (next_blocked >= blocked.size())
+					next_blocked = 0;
+				tcp_connection *connection = blocked[next_blocked];
+				spin_lock lock_guard(&fd_locks[connection->fd]);
+				if (connection->xmit())
+					blocked.erase(blocked.begin() + next_blocked);
+				else
+					next_blocked++;
+			}
 		}
 		
 		rinfos[slot].start_time = now;
-		server = request_servers[next_server];
-		next_server++;
-		if (next_server >= request_servers.size())
-			next_server = 0;
+		server = choose_server();
 		
 		header.length = request_lengths[next_length];
 		if ((header.length > HOMA_MAX_MESSAGE_LENGTH) && tcp_trunc)
@@ -2360,20 +2513,7 @@ void tcp_client::sender()
 		header.cid.client_port = id;
 		header.msg_id = slot;
 		header.freeze = freeze[header.cid.server];
-		size_t old_pending = connections[server]->pending();
-		tt("Sending TCP request, cid 0x%08x, id %u, length %d, pid %d",
-				header.cid, header.msg_id, header.length,
-				pid);
-		if ((!connections[server]->send_message(&header))
-				&& (old_pending == 0)) {
-			blocked.push_back(connections[server]);
-			if (connections[server]->pending() > max_pending) {
-				max_pending = connections[server]->pending();
-				log(NORMAL, "max_pending now %lu for "
-						"tcp_client %d\n",
-						max_pending, id);
-			}
-		}
+		send_request(server, &header, pid, &max_pending);
 		if (verbose)
 			log(NORMAL, "tcp_client %d.%d sent request to server %d, "
 					"port %d, length %d\n",
@@ -2437,11 +2577,24 @@ void tcp_client::receiver(int receiver_id)
 		tt("epoll_wait returned %d events in client pid %d",
 				num_events, pid);
 		for (int i = 0; i < num_events; i++) {
-			int fd = events[i].data.fd;
-			tcp_connection *connection = connections[fd];
+			std::lock_guard<std::recursive_mutex> lock(connection_mutex);
+			uint32_t connection_id = events[i].data.u32;
+			if (connection_id >= connections.size())
+				continue;
+			tcp_connection *connection = connections[connection_id];
+			if (connection == NULL)
+				continue;
 			if (events[i].events & EPOLLIN) {
-				spin_lock lock_guard(&fd_locks[fd]);
+				spin_lock lock_guard(&fd_locks[connection->fd]);
 				read(connection, pid);
+			}
+			if ((events[i].events & EPOLLOUT) && (connection_id < connections.size())
+					&& (connections[connection_id] == connection)) {
+				spin_lock lock_guard(&fd_locks[connection->fd]);
+				if (connection->xmit()) {
+					unblock_connection(connection);
+					connection->set_epoll_events(epoll_fd, EPOLLIN|epollet);
+				}
 			}
 		}
 	}
@@ -2455,8 +2608,10 @@ void tcp_client::receiver(int receiver_id)
  */
 void tcp_client::read(tcp_connection *connection, int pid)
 {
-	int error = connection->read(epollet, [this, pid]
+	bool got_response = false;
+	int error = connection->read(epollet, [this, pid, &got_response]
 			(message_header *header) {
+		got_response = true;
 		uint64_t end_time = rdtsc();
 		record(end_time, header);
 		tt("Response for cid 0x%08x received by pid %d", pid);
@@ -2468,6 +2623,8 @@ void tcp_client::read(tcp_connection *connection, int pid)
 				connection->error_message);
 		exit(1);
 	}
+	if (!tcp_client_pooling && got_response)
+		close_connection(connection->epoll_id);
 }
 
 /**
@@ -2637,6 +2794,11 @@ int client_cmd(std::vector<string> &words)
 	port_receivers = 1;
 	protocol = "homa";
 	server_nodes = 1;
+	tcp_fastopen = false;
+	tcp_http2 = false;
+	tcp_client_pooling = true;
+	tcp_load_aware = false;
+	tcp_stagger_us = 0;
 	tcp_trunc = true;
 	unloaded = 0;
 	workload = "100";
@@ -2666,6 +2828,19 @@ int client_cmd(std::vector<string> &words)
 			i++;
 		} else if (strcmp(option, "--iovec") == 0) {
 			client_iovec = true;
+		} else if (strcmp(option, "--tcp-fastopen") == 0) {
+			tcp_fastopen = true;
+		} else if (strcmp(option, "--tcp-http2") == 0) {
+			tcp_http2 = true;
+			tcp_client_pooling = true;
+		} else if (strcmp(option, "--tcp-load-aware") == 0) {
+			tcp_load_aware = true;
+		} else if (strcmp(option, "--tcp-no-pooling") == 0) {
+			tcp_client_pooling = false;
+		} else if (strcmp(option, "--tcp-stagger-us") == 0) {
+			if (!parse(words, i+1, &tcp_stagger_us, option, "integer"))
+				return 0;
+			i++;
 		} else if (strcmp(option, "--no-trunc") == 0) {
 			tcp_trunc = false;
 		} else if (strcmp(option, "--ports") == 0) {
@@ -2925,6 +3100,7 @@ int server_cmd(std::vector<string> &words)
 	port_threads = 1;
 	server_ports = 1;
 	server_iovec = false;
+	tcp_fastopen = false;
 	
 	for (unsigned i = 1; i < words.size(); i++) {
 		const char *option = words[i].c_str();
@@ -2943,6 +3119,8 @@ int server_cmd(std::vector<string> &words)
 			if (!parse(words, i+1, &server_ports, option, "integer"))
 				return 0;
 			i++;
+		} else if (strcmp(option, "--tcp-fastopen") == 0) {
+			tcp_fastopen = true;
 		} else if (strcmp(option, "--protocol") == 0) {
 			if ((i + 1) >= words.size()) {
 				printf("No value provided for %s\n",
