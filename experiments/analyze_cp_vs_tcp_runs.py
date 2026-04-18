@@ -225,7 +225,7 @@ def main():
     if plt is None:
         return
 
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(7.5, 4))
     for digest, color, label_prefix in [
         (dctcp_digest, "#7A4412", "DCTCP"),
         (homa_digest, "#1759BB", "Homa"),
@@ -240,12 +240,12 @@ def main():
     ax.set_ylabel("Slowdown")
     ax.set_title(f"{args.workload.upper()} slowdown over 5 runs")
     ax.grid(which="major", axis="y")
-    ax.legend(loc="upper right", prop={"size": 9})
-    fig.tight_layout()
-    fig.savefig(output_dir / f"vs_tcp_{args.workload}_p50_p90.pdf")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, prop={"size": 9})
+    fig.tight_layout(rect=(0, 0, 0.8, 1))
+    fig.savefig(output_dir / f"vs_tcp_{args.workload}_p50_p90.pdf", bbox_inches="tight")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(7.5, 4))
     ax.plot(dctcp_x, dctcp_y, label="DCTCP", color="#7A4412")
     ax.plot(homa_x, homa_y, label="Homa", color="#1759BB")
     ax.plot(unloaded_x, unloaded_y, label="Homa best case", color="#d62728")
@@ -255,9 +255,9 @@ def main():
     ax.set_ylabel("Fraction Longer")
     ax.set_title(f"{args.workload.upper()} shortest 10% RPCs")
     ax.grid(which="major", axis="both")
-    ax.legend(loc="upper right", prop={"size": 9})
-    fig.tight_layout()
-    fig.savefig(output_dir / f"short_cdf_{args.workload}.pdf")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, prop={"size": 9})
+    fig.tight_layout(rect=(0, 0, 0.8, 1))
+    fig.savefig(output_dir / f"short_cdf_{args.workload}.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
