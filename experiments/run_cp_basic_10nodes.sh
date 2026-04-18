@@ -209,7 +209,7 @@ num_nodes="$1"
 private_ip_pattern='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
 for i in $(seq 0 $((num_nodes-1))); do
     node="node-$i"
-    ssh "$node" bash -s -- "$node" "$private_ip_pattern" <<'INNER'
+    ssh "$node" "bash -s -- $(printf '%q' "$node") $(printf '%q' "$private_ip_pattern")" <<'INNER'
 set -euo pipefail
 node_name="$1"
 private_ip_pattern="$2"

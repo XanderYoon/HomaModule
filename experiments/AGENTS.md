@@ -14,9 +14,9 @@ This file is intentionally detailed. It is meant to answer:
 
 This directory currently contains:
 - `run_cp_basic_5nodes.sh`
-- `run_cp_transport_basic_5nodes.sh`
+- `run_cp_transport_basic.sh`
 - `run_cp_vs_tcp_5nodes.sh`
-- `run_cp_transport_vs_dctcp_5nodes.sh`
+- `run_cp_transport_vs_dctcp.sh`
 - `run_cp_vs_tcp_10nodes.sh`
 - `analyze_cp_vs_tcp_runs.py`
 - `results/`
@@ -212,10 +212,10 @@ Primary outputs:
 Validation status:
 - validated end-to-end after the wrapper fix
 
-### `run_cp_transport_basic_5nodes.sh`
+### `run_cp_transport_basic.sh`
 
 Purpose:
-- run the 5-node `cp_basic`-style transport comparison at 25 Gbps link settings
+- run the `cp_basic`-style transport comparison at 25 Gbps link settings
 - compare:
   - Homa
   - DCTCP
@@ -239,22 +239,28 @@ Main phases:
 - explicitly install rebuilt `cp_node`, `homa_prio`, and Python helpers onto every worker
 - refresh Homa and reset `net.ipv4.tcp_fastopen=0` before the benchmark
 - run:
-  - `./cp_transport_basic -n 5 -s <seconds> -l <logdir>`
+  - `./cp_transport_basic -n <num_nodes> -s <seconds> -l <logdir>`
 - fetch the remote log directory back to `experiments/results/`
 
 Primary outputs:
 - fetched timestamped directory:
   - `experiments/results/cp_transport_basic_<timestamp>/`
+- per-node Homa metrics snapshots for Homa runs:
+  - `<experiment>-<node>.metrics`
+- per-experiment TCP/IP counter reports for TCP-family runs:
+  - `reports/<experiment>.tcp_counters`
+- per-node qdisc snapshots for TCP-family runs:
+  - `<experiment>-<node>.qdisc`
 - plus, depending on manual fetch/debug history, some raw files may also appear in `experiments/results/`
 
 Validation status:
 - validated end-to-end after the transport wrapper fix
 - note that an earlier completed run hit a summary-print `KeyError` after all phases finished; `util/cp_transport_basic` was patched so missing parsed fields now print `n/a` instead of crashing
 
-### `run_cp_transport_vs_dctcp_5nodes.sh`
+### `run_cp_transport_vs_dctcp.sh`
 
 Purpose:
-- run the 5-node `cp_vs_tcp`-style transport comparison for a workload such as `w4`
+- run the `cp_vs_tcp`-style transport comparison for a workload such as `w4`
 - compare:
   - Homa
   - DCTCP
@@ -279,7 +285,7 @@ Main phases:
 - explicitly install rebuilt worker binaries on every node
 - refresh Homa and reset `net.ipv4.tcp_fastopen=0` before the benchmark
 - run:
-  - `./cp_transport_vs_dctcp -n 5 --servers 1 -w <workload> -b <gbps> -s <seconds> -l <logdir>`
+  - `./cp_transport_vs_dctcp -n <num_nodes> --servers 1 -w <workload> -b <gbps> -s <seconds> -l <logdir>`
 - fetch the remote log directory back to `experiments/results/`
 
 Primary outputs:
@@ -288,6 +294,14 @@ Primary outputs:
 - `reports/vs_tcp_<workload>_p50.pdf`
 - `reports/vs_tcp_<workload>_p99.pdf`
 - `reports/short_cdf_<workload>.pdf`
+- RTT samples for slowdown/CDF generation:
+  - `<experiment>-<node>.rtts`
+- per-node Homa metrics snapshots for Homa runs:
+  - `<experiment>-<node>.metrics`
+- per-experiment TCP/IP counter reports for TCP-family runs:
+  - `reports/<experiment>.tcp_counters`
+- per-node qdisc snapshots for TCP-family runs:
+  - `<experiment>-<node>.qdisc`
 - digest files:
   - `homa_<workload>.data`
   - `dctcp_<workload>.data`
@@ -364,6 +378,21 @@ Important report files:
 - `reports/cperf.log`
 - `reports/vs_tcp_<workload>.pdf`
 - `reports/short_cdf_<workload>.pdf`
+- `reports/<experiment>.tcp_counters`
+
+## Metrics Coverage
+
+The wrappers plus `util/cperf.py` currently capture:
+- slowdown plots and short-message RTT CDFs from raw `*.rtts` files for `cp_vs_tcp` and `cp_transport_vs_dctcp`
+- RTT latency and throughput/RPC-rate summaries from `node-*.log` parsing for `cp_basic` and `cp_transport_basic`
+- Homa kernel metrics snapshots via `metrics.py`, which include canaries such as `resent_packets`, `peer_timeouts`, `server_rpc_discards`, `data_xmit_errors`, and related transport-health counters
+- TCP/IP kernel counters via `nstat`, including retransmissions, TCP timeouts, Fast Open success/failure, receive/drop counters, and ECN counters such as `TcpExtTCPDeliveredCE` and `IpExtInCEPkts`
+- qdisc snapshots via `tc -s qdisc show` for each TCP-family experiment
+
+The wrappers do not currently produce:
+- a single merged summary file that combines RTT, throughput, Homa metrics, TCP counters, and qdisc data across all experiments
+- parsed packet-drop or queue-depth summaries from the raw qdisc text
+- NIC-level hardware drop counters from `ethtool -S`
 
 ## Preconditions Before Running
 
@@ -524,8 +553,8 @@ For 5 nodes:
 1. Run `CLOUDLAB_USER=ARY ssh_setup/ssh_setup_5nodes.sh` if cluster state is new or nodes were reprovisioned.
 2. For the original baseline, run `experiments/run_cp_vs_tcp_5nodes.sh --workload w4 --gbps 20 --dctcp true --tcp false`
 3. For the original baseline summary benchmark, run `experiments/run_cp_basic_5nodes.sh`
-4. For the transport comparison summary benchmark, run `experiments/run_cp_transport_basic_5nodes.sh`
-5. For the transport comparison slowdown/CDF benchmark, run `WORKLOAD=w4 GBPS=20 experiments/run_cp_transport_vs_dctcp_5nodes.sh`
+4. For the transport comparison summary benchmark, run `experiments/run_cp_transport_basic.sh`
+5. For the transport comparison slowdown/CDF benchmark, run `WORKLOAD=w4 GBPS=20 experiments/run_cp_transport_vs_dctcp.sh`
 6. Read fetched results under `experiments/results/`
 7. If you want a pooled figure across several repetitions of the original baseline, use `analyze_cp_vs_tcp_runs.py`
 

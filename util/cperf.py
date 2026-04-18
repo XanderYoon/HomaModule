@@ -520,6 +520,45 @@ def stop_nodes():
     active_nodes.clear()
     server_nodes = range(0,0)
 
+def drop_nodes(nodes):
+    """
+    Forcefully discard cp_node state for the given nodes.
+
+    This is used when a control command such as "stop servers" doesn't
+    return a prompt, which usually means the ssh/cp_node session on that
+    node is already broken or wedged. The caller can then restart cp_node
+    cleanly on demand.
+    """
+    global active_nodes, homa_prios
+    for id in nodes:
+        popen = active_nodes.pop(id, None)
+        if popen is not None:
+            try:
+                popen.stdin.close()
+            except Exception:
+                pass
+            try:
+                popen.stdout.close()
+            except Exception:
+                pass
+            try:
+                popen.terminate()
+            except Exception:
+                pass
+            try:
+                popen.wait(1.0)
+            except Exception:
+                pass
+        prio = homa_prios.pop(id, None)
+        if prio is not None:
+            subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id, "sudo",
+                    "pkill", "homa_prio"], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            try:
+                prio.wait(1.0)
+            except Exception:
+                pass
+
 def do_cmd(command, r, r2 = range(0,0)):
     """
     Execute a cp_node command on a given group of nodes.
@@ -544,7 +583,15 @@ def do_cmd(command, r, r2 = range(0,0)):
             active_nodes[id].stdin.flush()
         except BrokenPipeError:
             log("Broken pipe to node-%d" % (id))
-    wait_output("% ", nodes, command)
+    try:
+        wait_output("% ", nodes, command)
+    except Exception as e:
+        if command.startswith("stop "):
+            log("Ignoring failure during '%s'; dropping stale nodes: %s"
+                    % (command, str(nodes)))
+            drop_nodes(nodes)
+            return
+        raise e
 
 def do_ssh(command, nodes):
     """

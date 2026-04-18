@@ -174,7 +174,6 @@ setup_homa_on_node0() {
         mkdir -p ~/bin
         /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
         /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
-        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/*.py ~/bin/
     "
 }
 
@@ -235,7 +234,7 @@ main() {
     enable_dctcp_and_tfo
     verify_dctcp_and_tfo
 
-    log "done" "SSH bootstrap complete, Homa utilities are built on node0, and TCP tuning is enabled"
+    log "done" "10-node SSH bootstrap complete, Homa utilities are built on node0, and TCP tuning is enabled"
 }
 
 main "$@"
