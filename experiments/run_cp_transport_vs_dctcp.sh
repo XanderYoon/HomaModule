@@ -30,7 +30,7 @@ LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-$REPO_ROOT/experiments/results}"
 WORKLOAD="${WORKLOAD:-}"
 GBPS="${GBPS:-0.0}"
 SERVER_COUNT="${SERVER_COUNT:-0}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport_vs_dctcp"
 
 usage() {
     cat <<'EOF'
@@ -105,7 +105,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --local-results-dir)
             LOCAL_RESULTS_DIR="$2"
-            RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport"
+            RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport_vs_dctcp"
             shift 2
             ;;
         --start-script)

@@ -19,6 +19,10 @@ This directory currently contains:
 - `run_cp_vs_tcp_5nodes.sh`
 - `run_cp_transport_vs_dctcp.sh`
 - `run_cp_vs_tcp_10nodes.sh`
+- `tuning/run_http2_tuning.sh`
+- `tuning/run_connection_pooling_tuning.sh`
+- `tuning/run_static_offset_tuning.sh`
+- `run_dctcp_tuning.sh`
 - `analyze_cp_vs_tcp_runs.py`
 - `results/`
 
@@ -27,9 +31,15 @@ The scripts here are wrappers around the benchmark drivers in `util/`, especiall
 - `util/cp_transport_basic`
 - `util/cp_vs_tcp`
 - `util/cp_transport_vs_dctcp`
+- `util/cp_transport_vs_http2_sessions`
+- `util/cp_transport_vs_connection_pools`
+- `util/cp_transport_vs_static_offsets`
 - `util/cperf.py`
 - `util/cp_node`
 - `util/homa_prio`
+
+The transport-only DCTCP tuning wrappers live under `experiments/tuning/`.
+Their shared setup helper is `experiments/run_dctcp_tuning.sh`.
 
 The wrappers exist because the raw `util/` drivers assume a working cluster environment with:
 - SSH aliases like `node-0`, `node-1`, ...

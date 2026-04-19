@@ -189,28 +189,130 @@ verify_homa_on_node0() {
     "
 }
 
-enable_dctcp_and_tfo() {
+configure_dctcp() {
     for i in "${!HOSTS[@]}"; do
-        log "tcp-tuning" "Enabling DCTCP and TCP Fast Open on node$i"
+        log "dctcp" "Configuring DCTCP on node$i"
         ssh "node$i" '
             set -euo pipefail
-            sudo modprobe tcp_dctcp || true
+            sudo modprobe tcp_dctcp
             sudo sysctl -w net.ipv4.tcp_ecn=1
             sudo sysctl -w net.ipv4.tcp_congestion_control=dctcp
-            sudo sysctl -w net.ipv4.tcp_fastopen=3
+            sudo sysctl -w net.ipv4.tcp_fastopen=0
         '
     done
 }
 
-verify_dctcp_and_tfo() {
+verify_dctcp() {
     for i in "${!HOSTS[@]}"; do
-        log "tcp-verify" "Verifying DCTCP and TCP Fast Open on node$i"
+        log "dctcp-verify" "Verifying DCTCP on node$i"
         ssh "node$i" '
             set -euo pipefail
-            printf "tcp_ecn=%s\n" "$(sysctl -n net.ipv4.tcp_ecn)"
-            printf "tcp_congestion_control=%s\n" \
-                "$(sysctl -n net.ipv4.tcp_congestion_control)"
-            printf "tcp_fastopen=%s\n" "$(sysctl -n net.ipv4.tcp_fastopen)"
+            node_name="$(hostname)"
+            ecn="$(sysctl -n net.ipv4.tcp_ecn)"
+            cc="$(sysctl -n net.ipv4.tcp_congestion_control)"
+            tfo="$(sysctl -n net.ipv4.tcp_fastopen)"
+            [[ "$ecn" == "1" ]] || { echo "$node_name: tcp_ecn=$ecn, expected 1" >&2; exit 1; }
+            [[ "$cc" == "dctcp" ]] || { echo "$node_name: tcp_congestion_control=$cc, expected dctcp" >&2; exit 1; }
+            [[ "$tfo" == "0" ]] || { echo "$node_name: tcp_fastopen=$tfo, expected 0" >&2; exit 1; }
+            printf "%s: DCTCP OK\n" "$node_name"
+        '
+    done
+}
+
+configure_xl170_paper_hardware() {
+    for i in "${!HOSTS[@]}"; do
+        log "xl170-tuning" "Applying xl170 paper hardware settings on node$i"
+        ssh "node$i" '
+            set -euo pipefail
+            iface="ens1f1"
+            if [[ ! -d /sys/class/net/$iface ]]; then
+                echo "Expected xl170 interface $iface not found on $(hostname)" >&2
+                exit 1
+            fi
+            sudo ip link set dev "$iface" mtu 3000
+            sudo ethtool -K "$iface" tso on gso on gro on >/dev/null 2>&1 || true
+            if command -v cpupower >/dev/null 2>&1; then
+                sudo cpupower frequency-set -g performance >/dev/null 2>&1 || true
+            fi
+            for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                [[ -e "$f" ]] || continue
+                printf "performance\n" | sudo tee "$f" >/dev/null || true
+            done
+            sudo sysctl -w net.core.rps_sock_flow_entries=32768 >/dev/null
+            sudo ethtool -C "$iface" adaptive-rx off rx-usecs 5 rx-frames 1 >/dev/null 2>&1 || true
+            for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+                [[ -e "$f" ]] || continue
+                printf "2048\n" | sudo tee "$f" >/dev/null || true
+            done
+            for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+                [[ -e "$f" ]] || continue
+                printf "fffff\n" | sudo tee "$f" >/dev/null || true
+            done
+            sudo ethtool -K "$iface" ntuple on >/dev/null 2>&1 || true
+        '
+    done
+}
+
+verify_xl170_paper_hardware() {
+    for i in "${!HOSTS[@]}"; do
+        log "xl170-verify" "Verifying xl170 paper hardware settings on node$i"
+        ssh "node$i" '
+            set -euo pipefail
+            node_name="$(hostname)"
+            iface="ens1f1"
+            cpu_model="$(lscpu | awk -F: "/Model name:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            nic_driver="$(ethtool -i "$iface" 2>/dev/null | awk -F: "/driver:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            nic_speed="$(ethtool "$iface" 2>/dev/null | awk -F: "/Speed:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            if [[ "$cpu_model" != *"E5-2640 v4"* && "$cpu_model" != *"E5-2640v4"* ]]; then
+                echo "$node_name: unexpected CPU model: $cpu_model" >&2; exit 1
+            fi
+            if [[ "$nic_driver" != "mlx5_core" ]]; then
+                echo "$node_name: unexpected NIC driver: $nic_driver" >&2; exit 1
+            fi
+            if [[ "$nic_speed" != "25000Mb/s" ]]; then
+                echo "$node_name: unexpected NIC speed: $nic_speed" >&2; exit 1
+            fi
+            mtu="$(ip -o link show "$iface" | awk "{for (i=1;i<=NF;i++) if (\$i==\"mtu\") {print \$(i+1); exit}}")"
+            if [[ "$mtu" != "3000" ]]; then
+                echo "$node_name: MTU=$mtu, expected 3000" >&2; exit 1
+            fi
+            governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+            if [[ "$governor" != "performance" ]]; then
+                echo "$node_name: CPU governor=$governor, expected performance" >&2; exit 1
+            fi
+            rps_sock="$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null || echo 0)"
+            if [[ "$rps_sock" != "32768" ]]; then
+                echo "$node_name: rps_sock_flow_entries=$rps_sock, expected 32768" >&2; exit 1
+            fi
+            adaptive_rx="$(ethtool -c "$iface" 2>/dev/null | awk -F: "/Adaptive RX:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            rx_usecs="$(ethtool -c "$iface" 2>/dev/null | awk -F: "/rx-usecs:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            rx_frames="$(ethtool -c "$iface" 2>/dev/null | awk -F: "/rx-frames:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            if [[ "$rx_usecs" != "5" || "$rx_frames" != "1" || "$adaptive_rx" != off* ]]; then
+                echo "$node_name: coalescing adaptive-rx=$adaptive_rx rx-usecs=$rx_usecs rx-frames=$rx_frames, expected off/5/1" >&2; exit 1
+            fi
+            ntuple="$(ethtool -k "$iface" 2>/dev/null | awk -F: "/ntuple-filters:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            if [[ "$ntuple" != "on" ]]; then
+                echo "$node_name: ntuple-filters=$ntuple, expected on" >&2; exit 1
+            fi
+            tso="$(ethtool -k "$iface" 2>/dev/null | awk -F: "/tcp-segmentation-offload:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
+            if [[ "$tso" != "on" ]]; then
+                echo "$node_name: tcp-segmentation-offload=$tso, expected on" >&2; exit 1
+            fi
+            for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+                [[ -e "$f" ]] || continue
+                value="$(cat "$f")"
+                if [[ "$value" != "2048" ]]; then
+                    echo "$node_name: $f=$value, expected 2048" >&2; exit 1
+                fi
+            done
+            for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+                [[ -e "$f" ]] || continue
+                value="$(cat "$f")"
+                if [[ "$value" != "fffff" ]]; then
+                    echo "$node_name: $f=$value, expected fffff" >&2; exit 1
+                fi
+            done
+            printf "%s: xl170 paper hardware settings OK\n" "$node_name"
         '
     done
 }
@@ -231,10 +333,12 @@ main() {
     verify_node0_connectivity
     setup_homa_on_node0
     verify_homa_on_node0
-    enable_dctcp_and_tfo
-    verify_dctcp_and_tfo
+    configure_dctcp
+    verify_dctcp
+    configure_xl170_paper_hardware
+    verify_xl170_paper_hardware
 
-    log "done" "10-node SSH bootstrap complete, Homa utilities are built on node0, and TCP tuning is enabled"
+    log "done" "10-node SSH bootstrap complete, Homa utilities are built on node0, DCTCP and xl170 paper hardware settings are configured"
 }
 
 main "$@"

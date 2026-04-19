@@ -1,0 +1,103 @@
+qdisc mq 0: root 
+ Sent 491273642777 bytes 395170944 pkt (dropped 0, overlimits 0 requeues 39962) 
+ backlog 0b 0p requeues 39962
+qdisc fq_codel 0: parent :14 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 22868224780 bytes 19044042 pkt (dropped 0, overlimits 0 requeues 1830) 
+ backlog 0b 0p requeues 1830
+  maxpacket 68130 drop_overlimit 0 new_flow_count 4953 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :13 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 26873428020 bytes 21903495 pkt (dropped 0, overlimits 0 requeues 1598) 
+ backlog 0b 0p requeues 1598
+  maxpacket 68130 drop_overlimit 0 new_flow_count 4872 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :12 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 59214282608 bytes 44861702 pkt (dropped 0, overlimits 0 requeues 2107) 
+ backlog 0b 0p requeues 2107
+  maxpacket 68130 drop_overlimit 0 new_flow_count 6376 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :11 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 18806059839 bytes 15153021 pkt (dropped 0, overlimits 0 requeues 2144) 
+ backlog 0b 0p requeues 2144
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5955 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :10 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 21034458588 bytes 16946099 pkt (dropped 0, overlimits 0 requeues 1947) 
+ backlog 0b 0p requeues 1947
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5909 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :f limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 22865737240 bytes 19054479 pkt (dropped 0, overlimits 0 requeues 2089) 
+ backlog 0b 0p requeues 2089
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5453 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :e limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 17499235516 bytes 14935013 pkt (dropped 0, overlimits 0 requeues 2040) 
+ backlog 0b 0p requeues 2040
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5672 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :d limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 21930991268 bytes 17964511 pkt (dropped 0, overlimits 0 requeues 2064) 
+ backlog 0b 0p requeues 2064
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5814 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :c limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 25955862475 bytes 19977608 pkt (dropped 0, overlimits 0 requeues 2222) 
+ backlog 0b 0p requeues 2222
+  maxpacket 68130 drop_overlimit 0 new_flow_count 7498 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :b limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 18789708551 bytes 15715268 pkt (dropped 0, overlimits 0 requeues 2131) 
+ backlog 0b 0p requeues 2131
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5198 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :a limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 32121378127 bytes 25338047 pkt (dropped 0, overlimits 0 requeues 2372) 
+ backlog 0b 0p requeues 2372
+  maxpacket 68130 drop_overlimit 0 new_flow_count 6261 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :9 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 25187090797 bytes 20072983 pkt (dropped 0, overlimits 0 requeues 1852) 
+ backlog 0b 0p requeues 1852
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5271 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :8 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 25117727219 bytes 20948912 pkt (dropped 0, overlimits 0 requeues 1957) 
+ backlog 0b 0p requeues 1957
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5351 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :7 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 19209558786 bytes 15826223 pkt (dropped 0, overlimits 0 requeues 1972) 
+ backlog 0b 0p requeues 1972
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5924 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :6 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 18843176693 bytes 15862151 pkt (dropped 0, overlimits 0 requeues 1854) 
+ backlog 0b 0p requeues 1854
+  maxpacket 68130 drop_overlimit 0 new_flow_count 4741 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :5 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 22843098120 bytes 18021585 pkt (dropped 0, overlimits 0 requeues 1877) 
+ backlog 0b 0p requeues 1877
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5309 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :4 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 19892516190 bytes 16039780 pkt (dropped 0, overlimits 0 requeues 1819) 
+ backlog 0b 0p requeues 1819
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5807 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :3 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 25180944810 bytes 20057398 pkt (dropped 0, overlimits 0 requeues 2058) 
+ backlog 0b 0p requeues 2058
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5901 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :2 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 30657130326 bytes 24074528 pkt (dropped 0, overlimits 0 requeues 2182) 
+ backlog 0b 0p requeues 2182
+  maxpacket 68130 drop_overlimit 0 new_flow_count 5590 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+qdisc fq_codel 0: parent :1 limit 10240p flows 1024 quantum 1514 target 5.0ms interval 100.0ms memory_limit 32Mb ecn 
+ Sent 16383033220 bytes 13374105 pkt (dropped 0, overlimits 0 requeues 1847) 
+ backlog 0b 0p requeues 1847
+  maxpacket 68130 drop_overlimit 0 new_flow_count 4982 ecn_mark 0
+  new_flows_len 0 old_flows_len 0

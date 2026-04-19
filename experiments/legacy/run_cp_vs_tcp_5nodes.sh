@@ -148,7 +148,7 @@ require_cmd date
 
 STAMP="$(date +%Y%m%d%H%M%S)"
 LOG_DIR="$LOG_ROOT/cp_vs_tcp_${WORKLOAD}_${STAMP}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline_5nodes"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
 mkdir -p "$RESULTS_RUN_ROOT"
 HOSTS_FILE="$REPO_ROOT/ssh_setup/hosts_5.txt"

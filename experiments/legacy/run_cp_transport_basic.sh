@@ -16,7 +16,7 @@ HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
 HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-$REPO_ROOT/experiments/results}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport_basic_5nodes"
 
 log() {
     printf '\n[%s] %s\n' "$1" "$2"
