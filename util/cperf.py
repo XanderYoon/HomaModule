@@ -1700,6 +1700,7 @@ def start_slowdown_plot(title, max_y, x_experiment, size=10,
         ax.set_title(title, size=size)
     ax.set_xlim(0, 1.0)
     ax.set_yscale("log")
+    max_y = max_y * 1.25
     ax.set_ylim(1, max_y)
     ax.tick_params(right=True, which="both", direction="in", length=5)
     ticks = []
@@ -1756,6 +1757,22 @@ def start_slowdown_plot(title, max_y, x_experiment, size=10,
                 target_count = (total*tick)/10
         ax.set_xticks(ticks)
         ax.set_xticklabels(labels, size=size)
+        if len(digest["counts"]) > 0:
+            left_edges = [0.0] + digest["cum_frac"][:-1]
+            widths = [right - left for left, right in zip(left_edges,
+                    digest["cum_frac"])]
+            dist_axis = ax.twinx()
+            dist_axis.set_xlim(0, 1.0)
+            dist_axis.set_ylim(0, max(digest["counts"]) * 1.05)
+            dist_axis.bar(left_edges, digest["counts"], width=widths,
+                    align="edge", color="0.88", edgecolor="none",
+                    alpha=0.35, zorder=0)
+            dist_axis.set_yticks([])
+            dist_axis.tick_params(right=False, labelright=False)
+            for spine in dist_axis.spines.values():
+                spine.set_visible(False)
+            dist_axis.patch.set_alpha(0.0)
+            ax.patch.set_alpha(0.0)
     return ax
 
 def cdf_xaxis(ax, x_values, counts, num_ticks, size=10):

@@ -9,36 +9,47 @@ REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
 NUM_NODES="${NUM_NODES:-10}"
-RUN_SECONDS="${RUN_SECONDS:-10}"
+RUN_SECONDS="${RUN_SECONDS:-5}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 LINK_MBPS="${LINK_MBPS:-25000}"
 HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
 HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
 HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
 HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
+CLIENT_MAX="${CLIENT_MAX:-200}"
+CLIENT_PORTS="${CLIENT_PORTS:-3}"
+PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
+PORT_THREADS="${PORT_THREADS:-3}"
+SERVER_PORTS="${SERVER_PORTS:-3}"
+TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
+TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
+TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
+UNLOADED="${UNLOADED:-0}"
+UNSCHED="${UNSCHED:-0}"
+UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR_DEFAULT="$REPO_ROOT/experiments/results"
 LOCAL_RESULTS_DIR="$LOCAL_RESULTS_DIR_DEFAULT"
 RESULTS_RUN_ROOT=""
-WORKLOAD=""
-GBPS=""
+WORKLOAD="${WORKLOAD:-}"
+GBPS="${GBPS:-0.0}"
 TCP="false"
 DCTCP="true"
 SERVER_COUNT="${SERVER_COUNT:-0}"
 
 usage() {
     cat <<'EOF'
-Usage: run_baselines.sh --workload WORKLOAD [options]
-
-Required:
-  --workload W          Workload for cp_vs_tcp (w1-w5 or a fixed size)
+Usage: run_baselines.sh [options]
 
 Optional:
+  --workload W          Workload for cp_vs_tcp (w1-w5 or a fixed size);
+                        empty means run the built-in workload set
   --gbps B              Override bandwidth for the workload
   --servers N           cp_vs_tcp server layout: 0 means all nodes act as
                         both clients and servers, 1 gives 1 server + 9
                         clients (default: 0)
-  --seconds S           Duration of each experiment phase (default: 10)
+  --seconds S           Duration of each experiment phase (default: 5)
   --seconds-multiplier M  Scale the run duration by this factor (default: 1)
   --tcp BOOL            Run the regular TCP comparison too (default: false)
   --dctcp BOOL          Run the DCTCP comparison (default: true)
@@ -159,13 +170,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$WORKLOAD" ]]; then
-    echo "--workload is required" >&2
-    usage
-    exit 1
+if [[ -n "$WORKLOAD" ]]; then
+    WORKLOAD="$(normalize_workload "$WORKLOAD")"
 fi
-
-WORKLOAD="$(normalize_workload "$WORKLOAD")"
 
 if [[ "$NUM_NODES" -ne 10 ]]; then
     echo "This script is intended for 10 total nodes." >&2
@@ -186,7 +193,8 @@ TOPOLOGY_TAG="allnodes"
 if (( SERVER_COUNT > 0 )); then
     TOPOLOGY_TAG="servers${SERVER_COUNT}"
 fi
-LOG_DIR="$LOG_ROOT/baselines_${TOPOLOGY_TAG}_${WORKLOAD}_${STAMP}"
+WORKLOAD_TAG="${WORKLOAD:-allworkloads}"
+LOG_DIR="$LOG_ROOT/baselines_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
 RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
 mkdir -p "$RESULTS_RUN_ROOT"
@@ -410,9 +418,9 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -w $WORKLOAD -s $EFFECTIVE_SECONDS -l $LOG_DIR"
-if [[ -n "$GBPS" ]]; then
-    CP_VS_TCP_CMD+=" -b $GBPS"
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unloaded $UNLOADED --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+if [[ -n "$WORKLOAD" ]]; then
+    CP_VS_TCP_CMD+=" -w $WORKLOAD"
 fi
 
 log run "Launching cp_vs_tcp (baselines) on $NODE0_ALIAS with --servers $SERVER_COUNT"

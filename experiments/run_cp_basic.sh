@@ -14,6 +14,18 @@ HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
 HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
 HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
 HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
+CLIENT_MAX="${CLIENT_MAX:-200}"
+CLIENT_PORTS="${CLIENT_PORTS:-3}"
+PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
+PORT_THREADS="${PORT_THREADS:-3}"
+SERVER_PORTS="${SERVER_PORTS:-3}"
+TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
+TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
+TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
+UNLOADED="${UNLOADED:-0}"
+UNSCHED="${UNSCHED:-0}"
+UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-$REPO_ROOT/experiments/results}"
 DCTCP="${DCTCP:-true}"
@@ -235,7 +247,7 @@ done
 EOF
 
 log run "Launching cp_basic on $NODE0_ALIAS"
-ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && ./cp_basic -n $NUM_NODES -s $RUN_SECONDS --dctcp $DCTCP -l $LOG_DIR'"
+ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && ./cp_basic -n $NUM_NODES -s $RUN_SECONDS --dctcp $DCTCP -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unloaded $UNLOADED --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST'"
 
 log fetch "Copying cp_basic results back to $LOCAL_RUN_DIR"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
