@@ -213,6 +213,28 @@ EXPERIMENTS = [
     },
 ]
 
+PAPER_REFERENCE_ROWS = [
+    ("100B latency (us)", "15.1", "23.4", "24.1"),
+    ("500KB throughput (Gbps)", "10.0", "20.3", "20.5"),
+    ("Client throughput (Gbps)", "23.8", "23.9", "21.4"),
+    ("Server throughput (Gbps)", "23.7", "23.6", "22.4"),
+    ("Client RPC rate (Mops/sec)", "1.6", "1.0", "1.0"),
+    ("Server RPC rate (Mops/sec)", "1.6", "1.0", "1.0"),
+]
+
+PAPER_CAPTION = (
+    "Table 2: Basic Homa and TCP performance. The top two lines used "
+    "a single client thread issuing back-to-back requests to a single server. "
+    "Latency was measured end-to-end at application level with 100-byte requests "
+    "and responses; throughput was measured with 500 KB requests and responses. "
+    "For the remaining measurements each client had multiple threads; each thread "
+    "issued multiple concurrent RPCs. Client performance was measured with a single "
+    "client node spreading requests across 9 server nodes; server performance was "
+    "measured with 9 client nodes all issuing requests to a single server node. "
+    "Throughput was measured with 500 KB requests and responses and counts only "
+    "message payloads; RPC rate was measured with 100-byte requests and responses."
+)
+
 START_RE = re.compile(r"Starting (\S+) experiment")
 END_RE = re.compile(r"Ending (\S+) experiment")
 CLIENT_RE = re.compile(
@@ -237,6 +259,21 @@ def parse_args():
         "--output",
         default="experiments/results/cp_basic_table.md",
         help="Output markdown path",
+    )
+    parser.add_argument(
+        "--title",
+        default="cp_basic Table 2 Style Summary",
+        help="Markdown document title",
+    )
+    parser.add_argument(
+        "--include-paper-reference",
+        action="store_true",
+        help="Include the paper's Table 2 values for side-by-side reference",
+    )
+    parser.add_argument(
+        "--paper-caption",
+        action="store_true",
+        help="Use the Table 2 caption text from the paper verbatim",
     )
     return parser.parse_args()
 
@@ -413,10 +450,10 @@ def main():
 
     output = Path(args.output).resolve()
     rel_run_dir = run_dir.relative_to(Path.cwd())
-    caption = build_caption(num_nodes, num_servers)
+    caption = PAPER_CAPTION if args.paper_caption else build_caption(num_nodes, num_servers)
 
     lines = [
-        "# cp_basic Table 2 Style Summary",
+        f"# {args.title}",
         "",
         f"Source run: `{rel_run_dir}`",
         "",
@@ -429,9 +466,27 @@ def main():
         "  - throughput and RPC rate: maximum value",
         "- RPC rates are shown in `Mops/sec`, converted from the `Kops/sec` samples.",
         "",
-        "| Metric | Homa | TCP | DCTCP |",
-        "|---|---:|---:|---:|",
     ]
+
+    if args.include_paper_reference:
+        lines.extend(
+            [
+                "## Paper Table 2 Reference",
+                "",
+                "| Metric | Homa | TCP | DCTCP |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for metric, homa, tcp, dctcp in PAPER_REFERENCE_ROWS:
+            lines.append(f"| {metric} | {homa} | {tcp} | {dctcp} |")
+        lines.extend(["", "## Reproduced Results", ""])
+
+    lines.extend(
+        [
+            "| Metric | Homa | TCP | DCTCP |",
+            "|---|---:|---:|---:|",
+        ]
+    )
 
     metric_order = [
         "100B latency (us)",

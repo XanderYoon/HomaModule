@@ -1,0 +1,145 @@
+rdtsc_cycles                     19347833205 (8.1 s)      RDTSC cycle counter when metrics were gathered
+clock_rate                              2.39              CPU clock rate (GHz)
+large_msg_count                        45305 (  5.6 K/s)  # of incoming messages >= 131073 bytes
+large_msg_bytes                  22652500000 (2803.7 M/s) Bytes in incoming messages >= 131073 bytes
+received_msg_bytes               22652500000 (2803.7 M/s) Total bytes in all incoming messages
+sent_msg_bytes                   22646500000 (2802.9 M/s) Total bytes in all outgoing messages
+packets_sent_DATA                    1268335 (157.0 K/s)  DATA packets sent
+packets_sent_GRANT                   1177834 (145.8 K/s)  GRANT packets sent
+packets_sent_RESEND                      279 ( 34.5  /s)  RESEND packets sent
+packets_sent_ACK                       16792 (  2.1 K/s)  ACK packets sent
+packets_rcvd_DATA                   15992353 (  2.0 M/s)  DATA packets received
+packets_rcvd_GRANT                   1157073 (143.2 K/s)  GRANT packets received
+packets_rcvd_BUSY                        279 ( 34.5  /s)  BUSY packets received
+packets_rcvd_CUTOFFS                      10 (  1.2  /s)  CUTOFFS packets received
+packets_rcvd_NEED_ACK                  16792 (  2.1 K/s)  NEED_ACK packets received
+priority0_bytes                  19657241530 (2432.9 M/s) Bytes transmitted at priority 0
+priority7_bytes                   3486301822 (431.5 M/s)  Bytes transmitted at priority 7
+priority0_packets                    1087145 (134.6 K/s)  Packets transmitted at priority 0
+priority7_packets                    1376096 (170.3 K/s)  Packets transmitted at priority 7
+responses_received                     45305 (  5.6 K/s)  Incoming response messages
+responses_queued                         114 (0.3%)       Responses for which no thread was waiting
+fast_wakeups                            2495 (308.8  /s)  Messages received while polling
+slow_wakeups                           34344 (  4.3 K/s)  Messages received after thread went to sleep
+poll_cycles                       4381306535 (22.6%)      Time spent polling for incoming messages
+softirq_calls                        2015710 (249.5 K/s)  Calls to homa_softirq (i.e. # GRO pkts received)
+softirq_cycles                   14723860485 (76.1%)      Time spent in homa_softirq
+send_cycles                      18676519164 (96.5%)      Time spent in homa_ioc_send kernel call
+send_calls                             45293 (  5.6 K/s)  Total invocations of send kernel call
+recv_cycles                      39750241866 (205.5%)     Time spent in homa_ioc_recv kernel call
+recv_calls                             45308 (  5.6 K/s)  Total invocations of recv kernel call
+blocked_cycles                  133996314734 (692.6%)     Time spent blocked in homa_ioc_recv
+grant_cycles                      5231912779 (27.0%)      Time spent sending grants
+user_cycles                      40348015947 (208.5%)     App. time outside Homa kernel call handler
+timer_cycles                       249196681 (1.3%)       Time spent in homa_timer
+pacer_cycles                     18522252238 (95.7%)      Time spent in homa_pacer_main
+homa_cycles                      91922078225 (475.1%)     Total time in all Homa-related functions
+pacer_lost_cycles                  134203117 (0.7%)       Lost transmission time because pacer was slow
+pacer_bytes                      24666014488 (3052.9 M/s) Bytes transmitted when the pacer was active
+pacer_skipped_rpcs                     26437 (  3.3 K/s)  Pacer aborts because of locked RPCs
+pacer_needed_help                      26711 (  3.3 K/s)  homa_pacer_xmit invocations from homa_check_pacer
+throttled_cycles                 19045680808 (98.4%)      Time when the throttled queue was nonempty
+client_lock_misses                     28282 (  3.5 K/s)  Bucket lock misses for client RPCs
+client_lock_miss_cycles             47878274 (0.2%)       Time lost waiting for client bucket locks
+client_lock_miss_delay                 706.9              Avg. wait time per client_lock miss (ns)
+socket_lock_misses                    131975 ( 16.3 K/s)  Socket lock misses
+socket_lock_miss_cycles            212540084 (1.1%)       Time lost waiting for socket locks
+socket_lock_miss_delay                 672.5              Avg. wait time per socket_lock miss (ns)
+throttle_lock_misses                   55352 (  6.9 K/s)  Throttle lock misses
+throttle_lock_miss_cycles           30696639 (0.2%)       Time lost waiting for throttle locks
+throttle_lock_miss_delay               231.6              Avg. wait time per throttle_lock miss (ns)
+grantable_lock_misses                1675071 (207.3 K/s)  Grantable lock misses
+grantable_lock_miss_cycles        1068886145 (5.5%)       Time lost waiting for grantable lock
+grantable_lock_miss_delay              266.5              Avg. wait time per grantable_lock miss (ns)
+peer_lock_misses                          17 (  2.1  /s)  Peer lock misses
+peer_lock_miss_cycles                   6747 (0.0%)       Time lost waiting for peer locks
+peer_lock_miss_delay                   165.7              Avg. wait time per peer_lock miss (ns)
+disabled_reaps                          4465 (552.6  /s)  Reaper invocations that were disabled
+disabled_rpc_reaps                     14679 (  1.8 K/s)  Disabled RPCs skipped by reaper
+reaper_calls                         1761766 (218.1 K/s)  Reaper invocations that were not disabled
+reaper_dead_skbs                   697983549 ( 86.4 M/s)  Sum of hsk->dead_skbs across all reaper calls
+avg_dead_skbs                          396.2              Avg. hsk->dead_skbs in reaper
+throttle_list_adds                    587246 ( 72.7 K/s)  Calls to homa_add_to_throttled
+throttle_list_checks                 1246998 (154.3 K/s)  List elements checked in homa_add_to_throttled
+fifo_grants                             2085 (258.1  /s)  Grants issued using FIFO priority
+gro_benefit                             8.52              Homa packets per homa_softirq call
+
+Per-Core CPU Usage:
+-------------------
+               Core0   Core1   Core2   Core3   Core4   Core5   Core6   Core7 
+napi            0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+softirq         0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+send            0.05    0.01    0.19    0.29    0.00    0.11    0.05    0.00
+recv            0.14    0.12    0.07    0.01    0.15    0.11    0.18    0.14
+reply           0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+timer           0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+pacer           0.09    0.20    0.00    0.00    0.19    0.00    0.00    0.00
+Total           0.28    0.33    0.26    0.30    0.33    0.23    0.23    0.14
+
+               Core8   Core9   Core10  Core11  Core12  Core13  Core14  Core15
+napi            0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+softirq         0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+send            0.26    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+recv            0.01    0.13    0.15    0.01    0.07    0.01    0.19    0.08
+reply           0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+timer           0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+pacer           0.00    0.37    0.00    0.00    0.00    0.00    0.00    0.00
+Total           0.27    0.50    0.15    0.01    0.07    0.02    0.19    0.08
+
+               Core16  Core17  Core18  Core19
+napi            0.00    0.00    0.00    0.00
+softirq         0.00    0.00    0.00    0.00
+send            0.00    0.00    0.00    0.00
+recv            0.19    0.14    0.11    0.05
+reply           0.00    0.00    0.00    0.00
+timer           0.00    0.00    0.00    0.00
+pacer           0.00    0.11    0.00    0.00
+Total           0.20    0.25    0.11    0.05
+
+Overall Core Utilization:
+-------------------------
+send_syscall             0.97    172.20 us/syscall
+recv_syscall (-poll)     1.83    325.99 us/syscall
+reply_syscall            0.00      0.00 us/syscall
+NAPI                     0.00      0.00 us/packet
+Linux SoftIRQ            0.00      0.00 us/packet
+  Homa SoftIRQ           0.76      0.36 us/packet
+  Sending grants         0.27      0.13 us/packet
+Pacer                    0.96
+Timer handler            0.01
+------------------------------
+Total Core Utilization   3.76
+
+Polling in recv          0.23     40.38 us/syscall
+App/syscall              2.09    185.97 us/syscall
+
+Lock Misses:
+------------
+            Misses/sec.  ns/Miss   %CPU
+client          3.5 K     706.9     0.2
+socket         16.3 K     672.5     1.1
+grantable     207.3 K     266.5     5.5
+throttle        6.9 K     231.6     0.2
+peer            2.1       165.7     0.0
+
+Receiving Messages:
+-------------------
+Available immediately:   18.7%
+Arrival while polling:    5.5%
+Arrival while sleeping:  75.8%
+
+Miscellaneous:
+--------------
+Bytes/packet:        1320
+Packets received:   2.125 M/sec
+Packets sent:       0.305 M/sec
+Core efficiency:    0.646 M packets/sec/core (sent & received combined)
+                   11.92  Gbps/core (goodput)
+Pacer throughput:  24.81  Gbps
+
+Canaries (possible problem indicators):
+---------------------------------------
+responses_queued                         114 (0.3%)       Responses for which no thread was waiting
+pacer_lost_cycles                  134203117 (0.7%)       Lost transmission time because pacer was slow
+checks_per_throttle_insert               2.1              List traversals per throttle list insert
+acks_per_rpc                           370.6              ACK packets sent per 1000 client RPCs

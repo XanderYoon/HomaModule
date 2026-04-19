@@ -23,7 +23,6 @@ TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
 TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
-UNLOADED="${UNLOADED:-0}"
 UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
@@ -402,7 +401,7 @@ INNER
 done
 EOF
 
-CP_TRANSPORT_CMD="./cp_transport_vs_dctcp -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $RUN_SECONDS -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unloaded $UNLOADED --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_TRANSPORT_CMD="./cp_transport_vs_dctcp -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $RUN_SECONDS -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
 if [[ -n "$WORKLOAD" ]]; then
     CP_TRANSPORT_CMD+=" -w $WORKLOAD"
 fi
