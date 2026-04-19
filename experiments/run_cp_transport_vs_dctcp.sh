@@ -18,7 +18,29 @@ LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-$REPO_ROOT/experiments/results}"
 WORKLOAD="${WORKLOAD:-w4}"
 GBPS="${GBPS:-20}"
+SERVER_COUNT="${SERVER_COUNT:-0}"
 RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport"
+
+usage() {
+    cat <<'EOF'
+Usage: run_cp_transport_vs_dctcp.sh [options]
+
+Optional:
+  --workload W          Workload for cp_transport_vs_dctcp (w1-w5 or a fixed size)
+  --gbps B              Override bandwidth for the workload
+  --servers N           Transport layout: 0 means all nodes act as both clients
+                        and servers, 1 gives 1 server + 9 clients (default: 0)
+  --seconds S           Duration of each experiment phase (default: 10)
+  --link-mbps M         Homa link rate to configure on each node (default: 25000)
+  --log-root DIR        Parent directory for benchmark logs (default: logs)
+  --start-script NAME   Remote module start script, or 'generic'
+                        (default: generic)
+  --local-results-dir D Copy finished results from node0 to this local dir
+                        (default: experiments/results)
+  --num-nodes N         Total nodes in the cluster (default: 10)
+  --node0 HOST          SSH alias for orchestrator node (default: node0)
+EOF
+}
 
 log() {
     printf '\n[%s] %s\n' "$1" "$2"
@@ -31,14 +53,97 @@ require_cmd() {
     fi
 }
 
+normalize_workload() {
+    local workload="$1"
+    case "${workload,,}" in
+        w[1-5])
+            printf '%s' "${workload,,}"
+            ;;
+        *)
+            printf '%s' "$workload"
+            ;;
+    esac
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workload)
+            WORKLOAD="$2"
+            shift 2
+            ;;
+        --gbps)
+            GBPS="$2"
+            shift 2
+            ;;
+        --servers)
+            SERVER_COUNT="$2"
+            shift 2
+            ;;
+        --seconds)
+            RUN_SECONDS="$2"
+            shift 2
+            ;;
+        --link-mbps)
+            LINK_MBPS="$2"
+            shift 2
+            ;;
+        --log-root)
+            LOG_ROOT="$2"
+            shift 2
+            ;;
+        --local-results-dir)
+            LOCAL_RESULTS_DIR="$2"
+            RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport"
+            shift 2
+            ;;
+        --start-script)
+            START_SCRIPT="$2"
+            shift 2
+            ;;
+        --num-nodes)
+            NUM_NODES="$2"
+            shift 2
+            ;;
+        --node0)
+            NODE0_ALIAS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+WORKLOAD="$(normalize_workload "$WORKLOAD")"
+
 STAMP="$(date +%Y%m%d%H%M%S)"
-LOG_DIR="$LOG_ROOT/cp_transport_${WORKLOAD}_${STAMP}"
+TOPOLOGY_TAG="allnodes"
+if (( SERVER_COUNT > 0 )); then
+    TOPOLOGY_TAG="servers${SERVER_COUNT}"
+fi
+LOG_DIR="$LOG_ROOT/cp_transport_${TOPOLOGY_TAG}_${WORKLOAD}_${STAMP}"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
 mkdir -p "$RESULTS_RUN_ROOT"
 
 require_cmd ssh
 require_cmd rsync
 require_cmd date
+
+if [[ "$NUM_NODES" -ne 10 ]]; then
+    echo "This script is intended for 10 total nodes." >&2
+    exit 1
+fi
+
+if (( SERVER_COUNT < 0 || SERVER_COUNT >= NUM_NODES )); then
+    echo "--servers must be between 0 and $((NUM_NODES-1))" >&2
+    exit 1
+fi
 
 PRIVATE_IP_PATTERN='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
 
@@ -281,8 +386,8 @@ INNER
 done
 EOF
 
-log run "Launching cp_transport_vs_dctcp on $NODE0_ALIAS"
-ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && timeout 1800 ./cp_transport_vs_dctcp -n $NUM_NODES --servers 1 -w $WORKLOAD -b $GBPS -s $RUN_SECONDS -l $LOG_DIR'"
+log run "Launching cp_transport_vs_dctcp on $NODE0_ALIAS with --servers $SERVER_COUNT"
+ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && timeout 1800 ./cp_transport_vs_dctcp -n $NUM_NODES --servers $SERVER_COUNT -w $WORKLOAD -b $GBPS -s $RUN_SECONDS -l $LOG_DIR'"
 
 log fetch "Copying transport cp_vs_tcp results back to $LOCAL_RUN_DIR"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \

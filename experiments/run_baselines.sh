@@ -10,6 +10,7 @@ REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
 NUM_NODES="${NUM_NODES:-10}"
 RUN_SECONDS="${RUN_SECONDS:-10}"
+SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 LINK_MBPS="${LINK_MBPS:-25000}"
 HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
 HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
@@ -23,6 +24,7 @@ WORKLOAD=""
 GBPS=""
 TCP="false"
 DCTCP="true"
+SERVER_COUNT="${SERVER_COUNT:-0}"
 
 usage() {
     cat <<'EOF'
@@ -33,7 +35,11 @@ Required:
 
 Optional:
   --gbps B              Override bandwidth for the workload
+  --servers N           cp_vs_tcp server layout: 0 means all nodes act as
+                        both clients and servers, 1 gives 1 server + 9
+                        clients (default: 0)
   --seconds S           Duration of each experiment phase (default: 10)
+  --seconds-multiplier M  Scale the run duration by this factor (default: 1)
   --tcp BOOL            Run the regular TCP comparison too (default: false)
   --dctcp BOOL          Run the DCTCP comparison (default: true)
   --link-mbps M         Homa link rate to configure on each node (default: 25000)
@@ -51,7 +57,9 @@ Environment overrides:
 
 Notes:
   - Run ssh_setup/ssh_setup_10nodes.sh first so node aliases and key-based SSH are configured.
-  - This script assumes node0 is the only server and nodes 1..9 are clients.
+  - By default, this script uses the all-nodes cp_vs_tcp layout (`--servers 0`).
+  - Pass `--servers 1` to use the dedicated node-0 server and node-1..node-9
+    client layout.
   - The default startup path is 'generic', which discovers the active NIC
     and applies best-effort Homa setup for nodes that don't match the
     repo's xl170/m510-specific scripts.
@@ -73,6 +81,18 @@ require_cmd() {
     fi
 }
 
+normalize_workload() {
+    local workload="$1"
+    case "${workload,,}" in
+        w[1-5])
+            printf '%s' "${workload,,}"
+            ;;
+        *)
+            printf '%s' "$workload"
+            ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --workload)
@@ -83,8 +103,16 @@ while [[ $# -gt 0 ]]; do
             GBPS="$2"
             shift 2
             ;;
+        --servers)
+            SERVER_COUNT="$2"
+            shift 2
+            ;;
         --seconds)
             RUN_SECONDS="$2"
+            shift 2
+            ;;
+        --seconds-multiplier)
+            SECONDS_MULTIPLIER="$2"
             shift 2
             ;;
         --tcp)
@@ -137,8 +165,15 @@ if [[ -z "$WORKLOAD" ]]; then
     exit 1
 fi
 
+WORKLOAD="$(normalize_workload "$WORKLOAD")"
+
 if [[ "$NUM_NODES" -ne 10 ]]; then
-    echo "This script is intended for 10 total nodes (1 server + 9 clients)." >&2
+    echo "This script is intended for 10 total nodes." >&2
+    exit 1
+fi
+
+if (( SERVER_COUNT < 0 || SERVER_COUNT >= NUM_NODES )); then
+    echo "--servers must be between 0 and $((NUM_NODES-1))" >&2
     exit 1
 fi
 
@@ -147,7 +182,11 @@ require_cmd rsync
 require_cmd date
 
 STAMP="$(date +%Y%m%d%H%M%S)"
-LOG_DIR="$LOG_ROOT/baselines_${WORKLOAD}_${STAMP}"
+TOPOLOGY_TAG="allnodes"
+if (( SERVER_COUNT > 0 )); then
+    TOPOLOGY_TAG="servers${SERVER_COUNT}"
+fi
+LOG_DIR="$LOG_ROOT/baselines_${TOPOLOGY_TAG}_${WORKLOAD}_${STAMP}"
 RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
 mkdir -p "$RESULTS_RUN_ROOT"
@@ -163,6 +202,15 @@ if [[ "${#HOSTS[@]}" -ne "$NUM_NODES" ]]; then
     echo "Expected $NUM_NODES hosts in $HOSTS_FILE, found ${#HOSTS[@]}" >&2
     exit 1
 fi
+
+log sync "Pushing updated cp_vs_tcp sources to $NODE0_ALIAS"
+rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
+    "$REPO_ROOT/util/cp_vs_tcp" \
+    "$REPO_ROOT/util/cperf.py" \
+    "$REPO_ROOT/util/cp_node.cc" \
+    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/"
+
+ssh "$NODE0_ALIAS" "chmod 755 $REMOTE_REPO_DIR/util/cp_vs_tcp"
 
 log setup "Preparing node0 build and runtime environment on $NODE0_ALIAS"
 ssh "$NODE0_ALIAS" "
@@ -361,12 +409,13 @@ INNER
 done
 EOF
 
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers 1 --tcp $TCP --dctcp $DCTCP -w $WORKLOAD -s $RUN_SECONDS -l $LOG_DIR"
+EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -w $WORKLOAD -s $EFFECTIVE_SECONDS -l $LOG_DIR"
 if [[ -n "$GBPS" ]]; then
     CP_VS_TCP_CMD+=" -b $GBPS"
 fi
 
-log run "Launching cp_vs_tcp (baselines) on $NODE0_ALIAS"
+log run "Launching cp_vs_tcp (baselines) on $NODE0_ALIAS with --servers $SERVER_COUNT"
 ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && $CP_VS_TCP_CMD'"
 
 log fetch "Copying results back to $LOCAL_RUN_DIR"

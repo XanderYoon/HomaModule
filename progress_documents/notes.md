@@ -96,7 +96,7 @@ All statements below are tied to saved logs, metrics, or generated report files.
 
 - 10-node `cp_basic` baseline:
   - [experiments/results/cp_basic_20260401192606](/NAS/School/CS8803/HomaModule/experiments/results/cp_basic_20260401192606)
-  - summary table: [experiments/results/cp_basic_table2_summary.md](/NAS/School/CS8803/HomaModule/experiments/results/cp_basic_table2_summary.md)
+  - summary table: [experiments/results/cp_basic_table.md](/NAS/School/CS8803/HomaModule/experiments/results/cp_basic_table.md)
 - 10-node `cp_vs_tcp w4` baseline attempt:
   - [experiments/results/cp_vs_tcp_w4_20260401192723](/NAS/School/CS8803/HomaModule/experiments/results/cp_vs_tcp_w4_20260401192723)
 - 5-node manual `cp_basic` baseline:
@@ -119,7 +119,7 @@ The results tree has since been reorganized. The most relevant locations for the
 - baseline and manual run directories are now grouped under:
   - [experiments/results/runs/baseline](/NAS/School/CS8803/HomaModule/experiments/results/runs/baseline)
 - summary markdown is now under:
-  - [experiments/results/summaries/cp_basic_table2_summary.md](/NAS/School/CS8803/HomaModule/experiments/results/summaries/cp_basic_table2_summary.md)
+  - [experiments/results/summaries/cp_basic_table.md](/NAS/School/CS8803/HomaModule/experiments/results/summaries/cp_basic_table.md)
 
 ### New variants exercised
 
@@ -208,7 +208,7 @@ Interpretation:
 
 ### `cp_basic`
 
-The cleanest baseline summary is already captured in [experiments/results/cp_basic_table2_summary.md](/NAS/School/CS8803/HomaModule/experiments/results/cp_basic_table2_summary.md). The best-per-run values reported there are:
+The cleanest baseline summary is already captured in [experiments/results/cp_basic_table.md](/NAS/School/CS8803/HomaModule/experiments/results/cp_basic_table.md). The best-per-run values reported there are:
 
 | Metric | Homa | TCP | DCTCP |
 |---|---:|---:|---:|

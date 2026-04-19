@@ -14,6 +14,7 @@ This file is intentionally detailed. It is meant to answer:
 
 This directory currently contains:
 - `run_cp_basic_5nodes.sh`
+- `run_cp_basic.sh`
 - `run_cp_transport_basic.sh`
 - `run_cp_vs_tcp_5nodes.sh`
 - `run_cp_transport_vs_dctcp.sh`
@@ -166,6 +167,10 @@ Primary outputs:
 Validation status:
 - validated end-to-end after the wrapper fix
 
+For the 10-node wrapper:
+- `run_baselines.sh` now defaults to the all-nodes cp_vs_tcp layout (`--servers 0`)
+- pass `--servers 1` to use the dedicated node-0 server and node-1..node-9 clients layout
+
 ### `run_cp_basic_5nodes.sh`
 
 Purpose:
@@ -211,6 +216,10 @@ Primary outputs:
 
 Validation status:
 - validated end-to-end after the wrapper fix
+
+For the 10-node wrapper:
+- `run_cp_basic.sh` now defaults to keeping cp_node servers active on all nodes (`--servers 0`)
+- pass `--servers 1` to use the dedicated node-0 server and node-1..node-9 clients layout
 
 ### `run_cp_transport_basic.sh`
 
@@ -285,7 +294,7 @@ Main phases:
 - explicitly install rebuilt worker binaries on every node
 - refresh Homa and reset `net.ipv4.tcp_fastopen=0` before the benchmark
 - run:
-  - `./cp_transport_vs_dctcp -n <num_nodes> --servers 1 -w <workload> -b <gbps> -s <seconds> -l <logdir>`
+  - `./cp_transport_vs_dctcp -n <num_nodes> --servers <count> -w <workload> -b <gbps> -s <seconds> -l <logdir>`
 - fetch the remote log directory back to `experiments/results/`
 
 Primary outputs:
@@ -310,6 +319,10 @@ Primary outputs:
 
 Validation status:
 - validated end-to-end after the transport wrapper fix
+
+For the 10-node wrapper:
+- `run_cp_transport_vs_dctcp.sh` now defaults to the all-nodes layout (`--servers 0`)
+- pass `--servers 1` to use the dedicated node-0 server and node-1..node-9 clients layout
 - plot-only regeneration was also validated after patching the reporting path
 
 ### `run_cp_vs_tcp_10nodes.sh`
@@ -571,7 +584,7 @@ Validated wrapper runs:
 - `cp_transport_vs_dctcp_5nodes`: completed with reports under `experiments/results/cp_transport_w4_20260401210039/reports`
 
 Paper-style summary markdown saved at:
-- `experiments/results/cp_basic_table2_summary.md`
+- `experiments/results/cp_basic_table.md`
 
 Transport-comparison notes:
 - the generated `w4` plots currently exist at:

@@ -7,8 +7,6 @@ VARIANTS = [
         "name": "dctcp",
         "label": "DCTCP",
         "tcp_fastopen": False,
-        "tcp_client_pooling": False,
-        "seconds_multiplier": 6,
         "color99": dctcp_color,
         "color50": dctcp_color2,
     },
@@ -18,7 +16,6 @@ VARIANTS = [
         "tcp_fastopen": True,
         "tcp_client_pooling": False,
         "client_max": 32,
-        "seconds_multiplier": 6,
         "color99": pyplot_colors[4],
         "color50": pyplot_colors[6],
     },
@@ -70,12 +67,11 @@ def apply_variant_options(options, variant):
     configured = copy.deepcopy(options)
     for key, value in variant.items():
         if key in ("name", "label", "color99", "color50",
-                "netem_loss_percent", "netem_ecn",
-                "seconds_multiplier"):
+                "netem_loss_percent", "netem_ecn", "tcp_ecn"):
             continue
         setattr(configured, key, value)
-    configured.seconds = max(1, int(math.ceil(options.seconds
-            * variant.get("seconds_multiplier", 1))))
+    configured.seconds = max(1, int(math.ceil(
+            options.seconds * options.seconds_multiplier)))
     return configured
 
 def save_plot_with_side_legend(ax, path, legend_y=1.0):
@@ -90,7 +86,8 @@ def save_plot_with_side_legend(ax, path, legend_y=1.0):
 def configure_variant_environment(options, variant, all_nodes):
     set_sysctl_parameter("net.ipv4.tcp_congestion_control", "dctcp",
             all_nodes)
-    set_sysctl_parameter("net.ipv4.tcp_ecn", "1", all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_ecn",
+            "1" if variant.get("tcp_ecn", True) else "0", all_nodes)
     set_sysctl_parameter("net.ipv4.tcp_fastopen",
             "3" if getattr(options, "tcp_fastopen", False) else "0",
             all_nodes)
@@ -117,6 +114,10 @@ parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
         "and this value indicates the number of server nodes; all other "
         "nodes will be clients. If 0, each node runs both a client and a "
         "server (default: 0)")
+parser.add_argument('--seconds-multiplier', dest='seconds_multiplier',
+        type=float, metavar='M', default=1.0,
+        help="Scale the run duration for all variants by this factor "
+        "(default: 1.0)")
 options = parser.parse_args()
 init(options)
 if options.num_servers <= 0:
