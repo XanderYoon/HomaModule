@@ -40,6 +40,8 @@ require_cmd ssh
 require_cmd rsync
 require_cmd date
 
+PRIVATE_IP_PATTERN='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
+
 log sync "Pushing updated transport benchmark sources to $NODE0_ALIAS"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
     "$REPO_ROOT/util/cp_node.cc" \
@@ -81,6 +83,7 @@ ssh "$NODE0_ALIAS" "
     make -C util clean
     make -C util -j
     cp cloudlab/bin/* ~/bin/
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/homa.ko ~/bin/homa.ko
     /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
     /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
     /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/*.py ~/bin/
@@ -157,7 +160,21 @@ max_nic_queue_ns="$2"
 rtt_bytes="$3"
 grant_increment="$4"
 max_gso_size="$5"
-iface=$(ip -o -4 addr show scope global | awk '$4 ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/ {print $2; exit}')
+resolve_cluster_iface() {
+    local iface=""
+    local peer_ip=""
+    for host in node-1 node-0; do
+        peer_ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '!seen[$1]++ {print $1; exit}')"
+        [[ -n "$peer_ip" ]] || continue
+        iface="$(ip -o route get "$peer_ip" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+        if [[ -n "$iface" && "$iface" != "lo" && -e /sys/class/net/"$iface" ]]; then
+            echo "$iface"
+            return 0
+        fi
+    done
+    ip -o -4 addr show scope global | awk '$4 ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/ && $2 != "lo" {print $2; exit}'
+}
+iface="$(resolve_cluster_iface)"
 sudo rmmod homa >/dev/null 2>&1 || true
 sudo insmod ~/bin/homa.ko
 sudo sysctl -w net.homa.link_mbps="$link_mbps"
@@ -236,7 +253,21 @@ set -euo pipefail
 node_name="$1"
 private_ip_pattern="$2"
 getent hosts node-0 >/dev/null
-iface="$(ip -o -4 addr show scope global | awk -v pattern="$private_ip_pattern" '$4 ~ pattern {print $2; exit}')"
+resolve_cluster_iface() {
+    local iface=""
+    local peer_ip=""
+    for host in node-1 node-0; do
+        peer_ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '!seen[$1]++ {print $1; exit}')"
+        [[ -n "$peer_ip" ]] || continue
+        iface="$(ip -o route get "$peer_ip" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+        if [[ -n "$iface" && "$iface" != "lo" && -e /sys/class/net/"$iface" ]]; then
+            echo "$iface"
+            return 0
+        fi
+    done
+    ip -o -4 addr show scope global | awk -v pattern="$private_ip_pattern" '$4 ~ pattern && $2 != "lo" {print $2; exit}'
+}
+iface="$(resolve_cluster_iface)"
 if [[ -z "$iface" ]]; then
     echo "$node_name: couldn't determine private interface" >&2
     exit 1

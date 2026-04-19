@@ -1,0 +1,233 @@
+#!/usr/bin/python3
+
+from cperf import *
+
+DEFAULT_POOL_SIZES = [1, 2, 4, 8]
+load_info = [["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
+MIN_PLOT_SAMPLES = 1000
+TRANSPORT_DEFAULTS = {
+    "client_ports": 9,
+    "port_receivers": 1,
+    "server_ports": 6,
+    "port_threads": 3,
+    "tcp_client_ports": 9,
+    "tcp_server_ports": 16,
+}
+
+def parse_int_list(value, option_name):
+    try:
+        values = [int(part.strip()) for part in value.split(",") if part.strip()]
+    except ValueError:
+        raise Error("Illegal value for %s: %s" % (option_name, value))
+    if len(values) == 0:
+        raise Error("%s must contain at least one integer" % (option_name))
+    for item in values:
+        if item <= 0:
+            raise Error("%s values must be positive: %s" % (option_name, value))
+    return values
+
+def make_variants(pool_sizes):
+    variants = [
+        {
+            "name": "dctcp",
+            "label": "DCTCP",
+            "tcp_fastopen": False,
+            "tcp_client_pooling": False,
+            "color99": pyplot_colors[0],
+            "color50": pyplot_colors[1],
+        },
+        {
+            "name": "dctcp_tfo",
+            "label": "DCTCP + TFO",
+            "tcp_fastopen": True,
+            "tcp_client_pooling": False,
+            "client_max": 32,
+            "color99": pyplot_colors[2],
+            "color50": pyplot_colors[3],
+        },
+    ]
+    for index, pool_size in enumerate(pool_sizes):
+        color_base = pyplot_colors[((index + 2) * 2) % len(pyplot_colors)]
+        color_alt = pyplot_colors[((index + 2) * 2 + 1) % len(pyplot_colors)]
+        variants.append({
+            "name": "dctcp_tfo_pool_p%d" % (pool_size),
+            "label": "Connection Pool = %d" % (pool_size),
+            "tcp_fastopen": True,
+            "tcp_client_pooling": True,
+            "client_max": 32,
+            "tcp_client_ports": pool_size,
+            "color99": color_base,
+            "color50": color_alt,
+        })
+    return variants
+
+def apply_variant_options(options, variant):
+    configured = copy.deepcopy(options)
+    for key, value in variant.items():
+        if key in ("name", "label", "color99", "color50"):
+            continue
+        setattr(configured, key, value)
+    return configured
+
+def save_plot_with_side_legend(ax, path):
+    fig = ax.figure
+    legend = ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0, prop={'size': 9})
+    fig.set_size_inches(12, 5)
+    fig.tight_layout(rect=(0, 0, 0.93, 1))
+    fig.savefig(path, bbox_inches="tight",
+            bbox_extra_artists=[legend] if legend else None)
+
+def configure_variant_environment(options, all_nodes):
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", "dctcp",
+            all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_ecn", "1", all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_fastopen",
+            "3" if getattr(options, "tcp_fastopen", False) else "0",
+            all_nodes)
+    reset_tcp_netem(all_nodes)
+
+def plot_ready(experiment):
+    digest = get_digest(experiment)
+    if (digest["total_messages"] < MIN_PLOT_SAMPLES) or \
+            (len(digest["cum_frac"]) == 0):
+        log("Skipping %s in plots: only %d RTT samples available"
+                % (experiment, digest["total_messages"]))
+        return False
+    return True
+
+parser = get_parser(description=
+        'Measures slowdown as a function of message size for '
+        'DCTCP + TFO while sweeping the TCP connection pool size.',
+        usage='%(prog)s [options]',
+        defaults=TRANSPORT_DEFAULTS)
+parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
+        default=0, help="If nonzero, clients and servers will be segregated "
+        "and this value indicates the number of server nodes; all other "
+        "nodes will be clients. If 0, each node runs both a client and a "
+        "server (default: 0)")
+parser.add_argument('--pool-sizes', dest='pool_sizes', metavar='counts',
+        default="1,2,4,8",
+        help="Comma-separated connection pool sizes to compare "
+        "(default: 1,2,4,8)")
+options = parser.parse_args()
+pool_sizes = parse_int_list(options.pool_sizes, "--pool-sizes")
+VARIANTS = make_variants(pool_sizes)
+init(options)
+if options.num_servers <= 0:
+    servers = range(0, options.num_nodes)
+    clients = range(0, options.num_nodes)
+    options.num_clients = options.num_nodes
+    options.num_servers = options.num_nodes
+    bw_multiplier = 0.5
+else:
+    if options.num_servers >= options.num_nodes:
+        raise Error("Illegal value %d for --servers option; must be less "
+                "than --nodes (%d)" % (options.num_servers, options.num_nodes))
+    options.num_clients = options.num_nodes - options.num_servers
+    servers = range(0, options.num_servers)
+    clients = range(options.num_servers, options.num_nodes)
+    options.server_ports = options.server_ports * 2
+    options.client_ports = options.client_ports * 2
+    options.tcp_server_ports = options.tcp_server_ports * 2
+    options.tcp_client_ports = options.tcp_client_ports * 2
+    bw_multiplier = min(options.num_servers, options.num_clients) / options.num_clients
+
+if options.workload != "":
+    load_info = [[options.workload, options.gbps]]
+
+congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
+tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
+tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
+
+if not options.plot_only:
+    for workload, bw in load_info:
+        options.workload = workload
+        options.gbps = bw * bw_multiplier
+        try:
+            reset_tcp_netem(range(0, options.num_nodes))
+            for variant in VARIANTS:
+                tcp_options = apply_variant_options(options, variant)
+                tcp_options.protocol = "tcp"
+                configure_variant_environment(tcp_options,
+                        range(0, options.num_nodes))
+                start_servers(servers, tcp_options)
+                run_experiment("%s_%s" % (variant["name"], workload),
+                        clients, tcp_options)
+            reset_tcp_netem(range(0, options.num_nodes))
+        except Exception:
+            log(traceback.format_exc())
+
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn, range(0, options.num_nodes))
+    reset_tcp_netem(range(0, options.num_nodes))
+    log("Stopping nodes")
+    stop_nodes()
+    try:
+        scan_logs()
+    except Exception:
+        log(traceback.format_exc())
+
+for workload, bw in load_info:
+    first_exp = "%s_%s" % (VARIANTS[0]["name"], workload)
+    set_unloaded(first_exp)
+
+    log("Generating slowdown plot for %s" % (workload))
+    title = "%s %d nodes, %.1f Gbps" % (workload.capitalize(),
+            options.num_nodes, bw)
+    ax = start_slowdown_plot(title, 1000, first_exp)
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        if not plot_ready(exp):
+            continue
+        plot_slowdown(ax, exp, "p99", "%s P99" % (variant["label"]),
+                color=variant["color99"])
+        plot_slowdown(ax, exp, "p50", "%s P50" % (variant["label"]),
+                color=variant["color50"])
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_connection_pools_%s.pdf" % (options.log_dir,
+            workload))
+
+    log("Generating P50 slowdown plot for %s" % (workload))
+    ax = start_slowdown_plot(title + " P50", 1000, first_exp)
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        if not plot_ready(exp):
+            continue
+        plot_slowdown(ax, exp, "p50", "%s P50" % (variant["label"]),
+                color=variant["color50"])
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_connection_pools_%s_p50.pdf" % (options.log_dir,
+            workload))
+
+    log("Generating P99 slowdown plot for %s" % (workload))
+    ax = start_slowdown_plot(title + " P99", 1000, first_exp)
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        if not plot_ready(exp):
+            continue
+        plot_slowdown(ax, exp, "p99", "%s P99" % (variant["label"]),
+                color=variant["color99"])
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_connection_pools_%s_p99.pdf" % (options.log_dir,
+            workload))
+
+    log("Generating short message CDF for %s" % (workload))
+    start_cdf_plot(title, 10, 0.99e05, 1e-05, "RTT (usecs)",
+            "Cumulative Fraction Short Messages")
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        if not plot_ready(exp):
+            continue
+        x, y = get_short_cdf(exp)
+        if len(x) == 0:
+            continue
+        plt.plot(x, y, label=variant["label"], color=variant["color99"])
+    save_plot_with_side_legend(plt.gca(),
+            "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload))
+
+    log("Generating ECN and drop histograms for %s" % (workload))
+    generate_variant_event_histograms(title, workload, VARIANTS, options.log_dir)

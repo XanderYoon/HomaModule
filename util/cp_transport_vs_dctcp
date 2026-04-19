@@ -78,12 +78,12 @@ def apply_variant_options(options, variant):
             * variant.get("seconds_multiplier", 1))))
     return configured
 
-def save_plot_with_side_legend(ax, path):
+def save_plot_with_side_legend(ax, path, legend_y=1.0):
     fig = ax.figure
-    legend = ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
+    legend = ax.legend(loc="upper left", bbox_to_anchor=(1.02, legend_y),
             borderaxespad=0.0, prop={'size': 9})
-    fig.set_size_inches(7.5, 4)
-    fig.tight_layout(rect=(0, 0, 0.8, 1))
+    fig.set_size_inches(12, 5)
+    fig.tight_layout(rect=(0, 0, 0.93, 1))
     fig.savefig(path, bbox_inches="tight",
             bbox_extra_artists=[legend] if legend else None)
 
@@ -256,4 +256,8 @@ for workload, bw in load_info:
     plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
     plt.plot(unloaded_x, unloaded_y, label="Homa best case", color=unloaded_color)
     save_plot_with_side_legend(plt.gca(),
-            "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload))
+            "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload),
+            legend_y=0.88)
+
+    log("Generating ECN and drop histograms for %s" % (workload))
+    generate_variant_event_histograms(title, workload, VARIANTS, options.log_dir)

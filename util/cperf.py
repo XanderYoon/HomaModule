@@ -29,6 +29,7 @@ import os
 import platform
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import time
@@ -99,6 +100,26 @@ TCP_COUNTERS = [
     "IpExtInCEPkts",
 ]
 
+CLUSTER_IFACE_SCRIPT = (
+    "resolve_cluster_iface() { "
+    "local iface=\"\"; "
+    "local peer_ip=\"\"; "
+    "for host in node-1 node-0; do "
+    "peer_ip=$(getent ahostsv4 \"$host\" 2>/dev/null | "
+    "awk '!seen[$1]++ {print $1; exit}'); "
+    "[[ -n \"$peer_ip\" ]] || continue; "
+    "iface=$(ip -o route get \"$peer_ip\" 2>/dev/null | "
+    "awk '{for (i = 1; i < NF; i++) if ($i == \"dev\") {print $(i+1); exit}}'); "
+    "if [[ -n \"$iface\" && \"$iface\" != \"lo\" && -e /sys/class/net/\"$iface\" ]]; then "
+    "echo \"$iface\"; return 0; fi; "
+    "done; "
+    "ip -o -4 addr show scope global | "
+    "awk '$4 ~ /^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.)/ && "
+    "$2 != \"lo\" {print $2; exit}'; "
+    "}; "
+    "iface=$(resolve_cluster_iface); "
+)
+
 # Defaults for command-line options; assumes that servers and clients
 # share nodes.
 default_defaults = {
@@ -148,6 +169,14 @@ default_defaults = {
 # slow_999:        List of 999th percentile slowdowns corresponding to each length
 digests = {}
 
+# Keys are experiment names, and each value is parsed qdisc data for that
+# experiment.
+qdisc_digests = {}
+
+# Keys are experiment names, and each value is parsed aggregate TCP counter
+# data for that experiment.
+tcp_counter_digests = {}
+
 # A dictionary where keys are message lengths, and each value is the median
 # unloaded RTT (usecs) for messages of that length.
 unloaded_p50 = {}
@@ -179,6 +208,8 @@ load_info = [["w1", 1.4], ["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
 # PyPlot color circle colors:
 pyplot_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
         '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+
+PACKET_PAYLOAD_BYTES = 1500
 
 def boolean(s):
     """
@@ -353,7 +384,12 @@ def init(options):
     """
     Initialize various global state, such as the log file.
     """
+    global digests, qdisc_digests, tcp_counter_digests, unloaded_p50
     global log_dir, log_file, verbose
+    digests = {}
+    qdisc_digests = {}
+    tcp_counter_digests = {}
+    unloaded_p50.clear()
     log_dir = options.log_dir
     if not options.plot_only:
         if os.path.exists(log_dir):
@@ -601,6 +637,8 @@ def do_ssh(command, nodes):
     nodes:    specifies ids of the nodes on which to execute the command:
               should be a range, list, or other object that supports "in"
     """
+    if (len(command) == 3) and (command[0] == "bash") and (command[1] == "-lc"):
+        command = ["bash", "-lc", shlex.quote(command[2])]
     vlog("ssh command on nodes %s: %s" % (str(nodes), " ".join(command)))
     for id in nodes:
         subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id] + command,
@@ -615,6 +653,8 @@ def run_ssh_capture(command, nodes):
     Returns: dictionary keyed by node id; each value is stdout text
     """
     results = {}
+    if (len(command) == 3) and (command[0] == "bash") and (command[1] == "-lc"):
+        command = ["bash", "-lc", shlex.quote(command[2])]
     vlog("capturing ssh output on nodes %s: %s" % (str(nodes),
             " ".join(command)))
     for id in nodes:
@@ -673,12 +713,9 @@ def collect_qdisc_stats(nodes):
     Collect raw tc qdisc statistics for the cluster-facing interface on each
     node. The text is returned unparsed because formats vary across setups.
     """
-    script = (
-        "iface=$(ip -o -4 addr show scope global | grep ' 10\\.' | "
-        "head -n1 | awk '{print $2}'); "
+    script = (CLUSTER_IFACE_SCRIPT +
         "if [[ -z \\\"$iface\\\" ]]; then exit 0; fi; "
-        "sudo tc -s qdisc show dev \"$iface\""
-    )
+        "sudo tc -s qdisc show dev \"$iface\"")
     return run_ssh_capture(["bash", "-lc", script], nodes)
 
 def write_tcp_counter_reports(name, deltas, qdisc_stats):
@@ -743,13 +780,10 @@ def reset_tcp_netem(nodes):
     Remove any root netem qdisc from the default cluster-facing interface
     on the specified nodes.
     """
-    script = (
-        "iface=$(ip -o -4 addr show scope global | grep ' 10\\.' | "
-        "head -n1 | awk '{print $2}'); "
+    script = (CLUSTER_IFACE_SCRIPT +
         "if [[ -n \\\"$iface\\\" ]]; then "
         "sudo tc qdisc del dev \\\"$iface\\\" root >/dev/null 2>&1 || true; "
-        "fi"
-    )
+        "fi")
     do_ssh(["bash", "-lc", script], nodes)
 
 def configure_tcp_netem(nodes, loss_percent=0.0, ecn=False):
@@ -765,14 +799,11 @@ def configure_tcp_netem(nodes, loss_percent=0.0, ecn=False):
         command += " loss %.3f%%" % (loss_percent)
     if ecn:
         command += " ecn"
-    script = (
-        "iface=$(ip -o -4 addr show scope global | grep ' 10\\.' | "
-        "head -n1 | awk '{print $2}'); "
+    script = (CLUSTER_IFACE_SCRIPT +
         "if [[ -z \\\"$iface\\\" ]]; then "
         "echo missing cluster interface >&2; exit 1; "
         "fi; "
-        "%s" % (command)
-    )
+        "%s" % (command))
     do_ssh(["bash", "-lc", script], nodes)
 
 def get_sysctl_parameter(name):
@@ -1384,6 +1415,265 @@ def get_digest(experiment):
 
     digests[experiment] = digest
     return digest
+
+def get_qdisc_digest(experiment):
+    """
+    Parse aggregate qdisc statistics for a TCP experiment.
+
+    experiment:  Name of the experiment whose .qdisc files should be parsed
+    Returns:     A dictionary with aggregate packet, drop, and ECN mark counts.
+    """
+    global qdisc_digests, log_dir
+
+    if experiment in qdisc_digests:
+        return qdisc_digests[experiment]
+
+    digest = {
+        "files": 0,
+        "leaf_qdiscs": 0,
+        "packets": 0,
+        "drops": 0,
+        "ecn_mark": 0,
+    }
+
+    def parse_qdisc_block(header, sent_line, ecn_line):
+        if (not header) or (" parent :" not in header) or (" dev lo " in header):
+            return
+        match = re.search(r"Sent\s+\d+\s+bytes\s+(\d+)\s+pkt\s+\(dropped\s+(\d+)",
+                sent_line)
+        if not match:
+            return
+        digest["leaf_qdiscs"] += 1
+        digest["packets"] += int(match.group(1))
+        digest["drops"] += int(match.group(2))
+        match = re.search(r"ecn_mark\s+(\d+)", ecn_line)
+        if match:
+            digest["ecn_mark"] += int(match.group(1))
+
+    files = sorted(glob.glob("%s/%s-*.qdisc" % (log_dir, experiment)))
+    for file in files:
+        digest["files"] += 1
+        header = ""
+        sent_line = ""
+        ecn_line = ""
+        for line in open(file):
+            stripped = line.strip()
+            if stripped.startswith("qdisc "):
+                parse_qdisc_block(header, sent_line, ecn_line)
+                header = stripped
+                sent_line = ""
+                ecn_line = ""
+                continue
+            if stripped.startswith("Sent "):
+                sent_line = stripped
+                continue
+            if "ecn_mark" in stripped:
+                ecn_line = stripped
+        parse_qdisc_block(header, sent_line, ecn_line)
+
+    qdisc_digests[experiment] = digest
+    return digest
+
+def get_tcp_counter_digest(experiment):
+    """
+    Parse aggregate TCP/IP counter deltas for an experiment.
+
+    experiment:  Name of the experiment whose .tcp_counters report should
+                 be parsed
+    Returns:     Dictionary containing aggregate ECT, CE, and retrans counts
+    """
+    global tcp_counter_digests, log_dir
+
+    if experiment in tcp_counter_digests:
+        return tcp_counter_digests[experiment]
+
+    digest = {
+        "exists": False,
+        "ect_packets": 0,
+        "ce_packets": 0,
+        "retrans_segments": 0,
+    }
+    path = "%s/reports/%s.tcp_counters" % (log_dir, experiment)
+    if not os.path.exists(path):
+        tcp_counter_digests[experiment] = digest
+        return digest
+
+    digest["exists"] = True
+    for line in open(path):
+        stripped = line.strip()
+        if stripped == "":
+            break
+        if stripped.startswith("#"):
+            continue
+        match = re.match(r"(\S+)\s+(-?\d+)$", stripped)
+        if not match:
+            continue
+        name = match.group(1)
+        value = int(match.group(2))
+        if name == "IpExtInECT0Pkts":
+            digest["ect_packets"] = value
+        elif name == "IpExtInCEPkts":
+            digest["ce_packets"] = value
+        elif name == "TcpRetransSegs":
+            digest["retrans_segments"] = value
+
+    tcp_counter_digests[experiment] = digest
+    return digest
+
+def get_event_length_histogram(experiment, event_key,
+        packet_payload_bytes=PACKET_PAYLOAD_BYTES):
+    """
+    Estimate how aggregate qdisc events distribute across message-length
+    buckets, assuming each packet is equally likely to be marked or dropped.
+
+    experiment:            Name of the experiment to summarize
+    event_key:             Either "ce_packets" or "retrans_segments"
+    packet_payload_bytes:  Bytes of message payload per packet for estimating
+                           how many packets each message consumes
+    Returns:               Dictionary containing bucket-aligned event estimates
+    """
+    if event_key not in ["ce_packets", "retrans_segments"]:
+        raise Exception("Unknown event key %s" % (event_key))
+
+    digest = get_digest(experiment)
+    counters = get_tcp_counter_digest(experiment)
+    bucket_packets = [0.0] * len(digest["lengths"])
+    if len(bucket_packets) == 0:
+        return {
+            "total_events": 0,
+            "bucket_packets": bucket_packets,
+            "bucket_events": bucket_packets,
+        }
+
+    lengths = digest["lengths"]
+    bucket = 0
+    for length in sorted(digest["rtts"].keys()):
+        while (bucket < (len(lengths) - 1)) and (length > lengths[bucket]):
+            bucket += 1
+        packets_per_message = max(1, math.ceil(length/packet_payload_bytes))
+        bucket_packets[bucket] += len(digest["rtts"][length]) * packets_per_message
+
+    total_packets = sum(bucket_packets)
+    total_events = counters[event_key]
+    if total_packets == 0:
+        bucket_events = [0.0] * len(bucket_packets)
+    else:
+        bucket_events = [total_events * packets/total_packets
+                for packets in bucket_packets]
+    return {
+        "total_events": total_events,
+        "bucket_packets": bucket_packets,
+        "bucket_events": bucket_events,
+    }
+
+def start_length_histogram_plot(title, x_experiment, y_label, size=10,
+        figsize=[6,4]):
+    """
+    Create a pyplot graph for values bucketed by message length.
+    """
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    if title != "":
+        ax.set_title(title, size=size)
+    ax.set_xlim(0, 1.0)
+    ax.set_xlabel("Message Length (bytes)", size=size)
+    ax.set_ylabel(y_label, size=size)
+    ax.tick_params(right=True, which="both", direction="in", length=5)
+    ax.grid(which="major", axis="y")
+
+    top_axis = ax.twiny()
+    top_axis.tick_params(axis="x", direction="in", length=5)
+    top_axis.set_xlim(0, 1.0)
+    top_ticks = []
+    top_labels = []
+    for x in range(0, 11, 2):
+        top_ticks.append(x/10.0)
+        top_labels.append("%d%%" % (x*10))
+    top_axis.set_xticks(top_ticks)
+    top_axis.set_xticklabels(top_labels, size=size)
+    top_axis.set_xlabel("Cumulative % of Messages", size=size)
+    top_axis.xaxis.set_label_position('top')
+
+    digest = get_digest(x_experiment)
+    if len(digest["lengths"]) > 0:
+        cdf_xaxis(ax, digest["lengths"], digest["counts"], 11, size=size)
+    return ax
+
+def save_event_length_histogram(experiment, label, title, color, event_key,
+        path):
+    """
+    Save an estimated packet-event histogram and its backing data file.
+    """
+    event_titles = {
+        "ce_packets": "Estimated CE-Marked Packets by Message Length",
+        "retrans_segments": "Estimated Retransmitted Segments by Message Length",
+    }
+    info = get_event_length_histogram(experiment, event_key)
+    digest = get_digest(experiment)
+    counters = get_tcp_counter_digest(experiment)
+    ax = start_length_histogram_plot("%s\n%s" % (title, label), experiment,
+            event_titles[event_key])
+
+    left_edges = [0.0] + digest["cum_frac"][:-1]
+    widths = [right - left for left, right in zip(left_edges,
+            digest["cum_frac"])]
+    ax.bar(left_edges, info["bucket_events"], width=widths, align="edge",
+            color=color, edgecolor=color, alpha=0.75)
+    y_max = max(info["bucket_events"]) if len(info["bucket_events"]) > 0 else 0
+    ax.set_ylim(0, max(1.0, y_max * 1.15))
+    extra = ""
+    if event_key == "ce_packets":
+        extra = "\nECT0=%d" % (counters["ect_packets"])
+    ax.text(0.99, 0.95, "total=%d%s" % (info["total_events"], extra),
+            transform=ax.transAxes, horizontalalignment="right",
+            verticalalignment="top", fontsize=9)
+
+    fig = ax.figure
+    fig.tight_layout()
+    fig.savefig(path)
+
+    data_path = path[:-4] + ".data"
+    with open(data_path, "w") as f:
+        f.write("# %s for %s (%s)\n" % (event_titles[event_key], experiment,
+                label))
+        f.write("# Values are estimated by distributing aggregate TCP/IP events\n")
+        f.write("# across message-length buckets in proportion to estimated\n")
+        f.write("# packet counts per bucket.\n")
+        if event_key == "ce_packets":
+            f.write("# aggregate_ect0_packets %d\n" % (counters["ect_packets"]))
+            f.write("# aggregate_ce_packets   %d\n" % (counters["ce_packets"]))
+        else:
+            f.write("# aggregate_retrans_segments %d\n"
+                    % (counters["retrans_segments"]))
+        f.write("# length  cum_frac  messages  est_packets  est_events\n")
+        for i in range(len(digest["lengths"])):
+            f.write(" %7d %9.6f %8d %12.1f %11.3f\n"
+                    % (digest["lengths"][i], digest["cum_frac"][i],
+                    digest["counts"][i], info["bucket_packets"][i],
+                    info["bucket_events"][i]))
+
+def generate_variant_event_histograms(title, workload, variants, log_dir):
+    """
+    Generate CE-mark and retransmission histograms for each TCP variant in a
+    workload.
+    """
+    for variant in variants:
+        experiment = "%s_%s" % (variant["name"], workload)
+        digest = get_digest(experiment)
+        if (digest["total_messages"] == 0) or (len(digest["cum_frac"]) == 0):
+            log("Skipping event histograms for %s: no RTT data" % (experiment))
+            continue
+        counters = get_tcp_counter_digest(experiment)
+        if not counters["exists"]:
+            log("Skipping event histograms for %s: no TCP counter report"
+                    % (experiment))
+            continue
+        save_event_length_histogram(experiment, variant["label"], title,
+                variant["color99"], "ce_packets",
+                "%s/reports/%s_ce_by_length.pdf" % (log_dir, experiment))
+        save_event_length_histogram(experiment, variant["label"], title,
+                variant["color50"], "retrans_segments",
+                "%s/reports/%s_retrans_by_length.pdf" % (log_dir, experiment))
 
 def start_slowdown_plot(title, max_y, x_experiment, size=10,
         show_top_label=True, show_bot_label=True, figsize=[6,4],
