@@ -10,13 +10,15 @@ HOSTS_FILE="$SCRIPT_DIR/hosts_10.txt"
 SSH_DIR="$HOME/.ssh"
 CONFIG_DIR="$SSH_DIR/config.d"
 LOCAL_CONFIG_FILE="$CONFIG_DIR/cloudlab"
+SSH_KNOWN_HOSTS_FILE="$SSH_DIR/known_hosts.cloudlab"
+RSYNC_RSH="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
 
 NODE0_ALIAS="${NODE0_ALIAS:-node0}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 
-REPO_URL="${HOMA_REPO_URL:-https://github.com/PlatformLab/HomaModule.git}"
-REPO_BRANCH="${HOMA_REPO_BRANCH:-}"
+REPO_URL="${HOMA_REPO_URL:-https://github.com/XanderYoon/HomaModule.git}"
+REPO_BRANCH="${HOMA_REPO_BRANCH:-main}"
 
 START_SCRIPT="${START_SCRIPT:-start_xl170}"
 NUM_NODES=10
@@ -89,6 +91,8 @@ read_hosts() {
 ensure_local_key() {
     mkdir -p "$SSH_DIR" "$CONFIG_DIR"
     chmod 700 "$SSH_DIR"
+    touch "$SSH_KNOWN_HOSTS_FILE"
+    chmod 600 "$SSH_KNOWN_HOSTS_FILE"
 
     if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
         ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N ""
@@ -105,8 +109,9 @@ EOF
 Host node$i node-$i cloudlab-node$i cloudlab-node-$i
     HostName ${HOSTS[$i]}
     User $REMOTE_USER
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile $SSH_KNOWN_HOSTS_FILE
+    LogLevel ERROR
     ConnectTimeout 15
     ServerAliveInterval 10
     ServerAliveCountMax 3
@@ -125,7 +130,14 @@ install_local_key_on_nodes() {
 
     for i in "${!HOSTS[@]}"; do
         log local-ssh "Installing local SSH key on node$i (${HOSTS[$i]})"
-        ssh "$REMOTE_USER@${HOSTS[$i]}" "
+        ssh \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$SSH_KNOWN_HOSTS_FILE" \
+            -o LogLevel=ERROR \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=3 \
+            "$REMOTE_USER@${HOSTS[$i]}" "
             set -euo pipefail
             mkdir -p ~/.ssh
             chmod 700 ~/.ssh
@@ -150,6 +162,8 @@ prepare_node0() {
         set -euo pipefail
         mkdir -p ~/.ssh ~/.ssh/config.d ~/bin
         chmod 700 ~/.ssh
+        touch ~/.ssh/known_hosts.cloudlab
+        chmod 600 ~/.ssh/known_hosts.cloudlab
 
         if [[ ! -f ~/.ssh/id_ed25519 ]]; then
             ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ''
@@ -234,8 +248,9 @@ EOF
 Host node$i
     HostName ${HOSTS[$i]}
     User $REMOTE_USER
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile ~/.ssh/known_hosts.cloudlab
+    LogLevel ERROR
     ConnectTimeout 15
     ServerAliveInterval 10
     ServerAliveCountMax 3
@@ -300,8 +315,9 @@ while read -r alias ip; do
 Host $alias
     HostName $ip
     User $(whoami)
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile ~/.ssh/known_hosts.cloudlab
+    LogLevel ERROR
     ConnectTimeout 15
     ServerAliveInterval 10
     ServerAliveCountMax 3
@@ -358,6 +374,7 @@ rps_sock_flow_entries="${17}"
 rps_flow_cnt="${18}"
 rps_cpus_mask="${19}"
 tcp_fastopen="${20}"
+rsync_rsh="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts.cloudlab -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
 
 case "$remote_repo_dir" in
     "~")
@@ -395,16 +412,16 @@ for i in $(seq 0 $((num_nodes-1))); do
         fi
     "
 
-    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+    rsync -e "$rsync_rsh" -rt \
         ~/.bashrc ~/.bash_profile "$node:"
 
-    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+    rsync -e "$rsync_rsh" -rt \
         ~/bin/ "$node:~/bin/"
 
-    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+    rsync -e "$rsync_rsh" -rt \
         homa.ko util/cp_node util/homa_prio util/*.py "$node:~/bin/"
 
-    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+    rsync -e "$rsync_rsh" -rt \
         /tmp/homa_node_hosts "$node:/tmp/homa_node_hosts"
 
     ssh "$node" "
@@ -496,10 +513,30 @@ sudo sysctl -w net.ipv4.tcp_ecn=1 >/dev/null
 sudo sysctl -w net.ipv4.tcp_congestion_control=dctcp >/dev/null
 sudo sysctl -w net.ipv4.tcp_fastopen="$tcp_fastopen" >/dev/null
 
+ensure_homa_loaded() {
+    local module_path="$1"
+
+    if lsmod | grep -q '^homa'; then
+        for _attempt in 1 2 3; do
+            sudo rmmod homa >/dev/null 2>&1 || true
+            if ! lsmod | grep -q '^homa'; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    if lsmod | grep -q '^homa'; then
+        echo "Homa module already loaded on $(hostname); skipping reload" >&2
+        return 0
+    fi
+
+    sudo insmod "$module_path"
+}
+
 sudo pkill cp_node >/dev/null 2>&1 || true
 sudo pkill homa_prio >/dev/null 2>&1 || true
-sudo rmmod homa >/dev/null 2>&1 || true
-sudo insmod ~/bin/homa.ko
+ensure_homa_loaded ~/bin/homa.ko
 
 sudo sysctl -w net.homa.link_mbps="$link_mbps" >/dev/null
 sudo sysctl -w net.homa.max_nic_queue_ns="$max_nic_queue_ns" >/dev/null

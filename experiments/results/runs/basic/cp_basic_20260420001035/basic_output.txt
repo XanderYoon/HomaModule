@@ -1,0 +1,75 @@
+Starting homa servers 1:4
+Starting homa_latency experiment with clients 0:0
+Retrieving data for homa_latency experiment
+Starting homa_1msg_tput experiment with clients 0:0
+Retrieving data for homa_1msg_tput experiment
+Starting homa_client_rpc_tput experiment with clients 0:0
+Retrieving data for homa_client_rpc_tput experiment
+Starting homa_client_tput experiment with clients 0:0
+Retrieving data for homa_client_tput experiment
+Starting homa servers 0:0
+Starting homa_server_rpc_tput experiment with clients 1:4
+Retrieving data for homa_server_rpc_tput experiment
+Starting homa_server_tput experiment with clients 1:4
+Retrieving data for homa_server_tput experiment
+Starting tcp servers 1:4
+Starting tcp_latency experiment with clients 0:0
+Retrieving data for tcp_latency experiment
+TCP counters for tcp_latency: IpExtInECT0Pkts=415314
+Starting tcp_1msg_tput experiment with clients 0:0
+Retrieving data for tcp_1msg_tput experiment
+TCP counters for tcp_1msg_tput: IpExtInECT0Pkts=9536417, TcpRetransSegs=661, TcpExtTCPFastRetrans=661
+Starting tcp_client_rpc_tput experiment with clients 0:0
+Retrieving data for tcp_client_rpc_tput experiment
+TCP counters for tcp_client_rpc_tput: IpExtInECT0Pkts=7242743, TcpRetransSegs=7
+Starting tcp_client_tput experiment with clients 0:0
+Retrieving data for tcp_client_tput experiment
+TCP counters for tcp_client_tput: IpExtInECT0Pkts=24553000, TcpRetransSegs=6556, TcpExtTCPFastRetrans=6556
+Starting tcp servers 0:0
+Starting tcp_server_rpc_tput experiment with clients 1:4
+Retrieving data for tcp_server_rpc_tput experiment
+TCP counters for tcp_server_rpc_tput: IpExtInECT0Pkts=12897721, TcpRetransSegs=53, TcpExtTCPFastRetrans=4
+Starting tcp_server_tput experiment with clients 1:4
+Retrieving data for tcp_server_tput experiment
+TCP counters for tcp_server_tput: IpExtInECT0Pkts=24977782, TcpRetransSegs=2249, TcpExtTCPFastRetrans=2249
+Starting tcp servers 1:4
+Starting dctcp_latency experiment with clients 0:0
+Retrieving data for dctcp_latency experiment
+TCP counters for dctcp_latency: IpExtInECT0Pkts=433870
+Starting dctcp_1msg_tput experiment with clients 0:0
+Retrieving data for dctcp_1msg_tput experiment
+TCP counters for dctcp_1msg_tput: IpExtInECT0Pkts=9813226, TcpRetransSegs=560, TcpExtTCPFastRetrans=560
+Starting dctcp_client_rpc_tput experiment with clients 0:0
+Retrieving data for dctcp_client_rpc_tput experiment
+TCP counters for dctcp_client_rpc_tput: IpExtInECT0Pkts=7470503, TcpRetransSegs=6
+Starting dctcp_client_tput experiment with clients 0:0
+Retrieving data for dctcp_client_tput experiment
+TCP counters for dctcp_client_tput: IpExtInECT0Pkts=28055038, TcpRetransSegs=4705, TcpExtTCPFastRetrans=4705
+Starting tcp servers 0:0
+Starting dctcp_server_rpc_tput experiment with clients 1:4
+Retrieving data for dctcp_server_rpc_tput experiment
+TCP counters for dctcp_server_rpc_tput: IpExtInECT0Pkts=14620561, TcpRetransSegs=47, TcpExtTCPFastRetrans=2
+Starting dctcp_server_tput experiment with clients 1:4
+Retrieving data for dctcp_server_tput experiment
+TCP counters for dctcp_server_tput: IpExtInECT0Pkts=28273456, TcpRetransSegs=1339, TcpExtTCPFastRetrans=1339
+Stopping nodes
+Homa RTT latency (us): 14.73 (14.75 14.71 14.71 14.74 14.72)
+Homa single message throughput (Gbps): 7.9 (8.2 7.8 7.9 7.8 7.8)
+Homa client RPC throughput (Kops/sec): 1531.58 (1497.74 1531.59 1563.30 1532.67 1532.62)
+Homa server RPC throughput (Kops/sec): 1222.78 (1215.53 1224.31 1224.36 1224.81 1224.88)
+Homa client throughput (Gbps): 22.67 (22.66 22.71 22.72 22.63 22.64)
+Homa server throughput (Gbps): 22.69 (22.58 22.71 22.71 22.73 22.72)
+
+TCP RTT latency (us): 23.63 (24.16 23.95 23.80 23.35 22.88)
+TCP single message throughput (Gbps): 18.38 (17.86 18.46 18.54 18.36 18.68)
+TCP client RPC throughput (Kops/sec): 599.88 (560.22 607.65 610.68 610.84 610.01)
+TCP server RPC throughput (Kops/sec): 1038.46 (1040.04 1033.65 1041.56 1037.26 1039.77)
+TCP client throughput (Gbps): 23.19 (23.12 23.21 23.20 23.22 23.18)
+TCP server throughput (Gbps): 23.23 (22.98 23.25 23.30 23.28 23.30 23.30)
+
+DCTCP RTT latency (us): 22.27 (22.46 22.30 22.16 22.12 22.33)
+DCTCP single message throughput (Gbps): 18.62 (18.64 18.70 18.72 18.70 18.36)
+DCTCP client RPC throughput (Kops/sec): 608.20 (602.14 612.12 609.39 609.75 607.59)
+DCTCP server RPC throughput (Kops/sec): 1057.11 (1053.33 1060.86 1061.56 1057.55 1052.24)
+DCTCP client throughput (Gbps): 23.17 (23.08 23.17 23.20 23.18 23.20)
+DCTCP server throughput (Gbps): 23.28 (23.26 23.28 23.29 23.28 23.29)

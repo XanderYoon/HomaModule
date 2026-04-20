@@ -140,6 +140,7 @@ default_defaults = {
     'tcp_fastopen':        False,
     'tcp_http2':           False,
     'tcp_client_pooling':  True,
+    'tcp_loss_percent':    0.0,
     'tcp_load_aware':      False,
     'tcp_port_receivers':  1,
     'tcp_server_ports':    8,
@@ -339,6 +340,12 @@ def get_parser(description, usage, defaults = {}):
             type=boolean, default=defaults['tcp_client_pooling'],
             help='Reuse established TCP client connections across RPCs '
             '(default: true)')
+    parser.add_argument('--tcp-loss-percent', type=float,
+            dest='tcp_loss_percent', metavar='percent',
+            default=defaults['tcp_loss_percent'],
+            help='Artificial packet loss percentage to apply on the '
+            'cluster-facing interface during TCP-family experiments '
+            '(default: %.3f)' % (defaults['tcp_loss_percent']))
     parser.add_argument('--tcp-load-aware', dest='tcp_load_aware',
             type=boolean, default=defaults['tcp_load_aware'],
             help='Choose the least-backed-up TCP session for each new RPC '
@@ -444,8 +451,8 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
     start_time = time.time()
     while time.time() < (start_time + time_limit):
         for id in nodes:
-            data = active_nodes[id].stdout.read(1000)
-            if data != None:
+            data = read_node_output(id)
+            if data is not None:
                 print_data = data
                 if print_data.endswith(string):
                     print_data = print_data[:(len(data) - len(string))]
@@ -454,7 +461,7 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
                 outputs[id] += data
             status = active_nodes[id].poll()
             if status != None:
-                data = active_nodes[id].stdout.read()
+                data = read_node_output(id)
                 if data:
                     outputs[id] += data
                 detail = ("node-%d exited with status %d after command '%s'"
@@ -486,6 +493,23 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
     raise Exception("bad output from node-%d after command '%s': "
             "expected '%s', got '%s'"
             % (bad_node, cmd, string, outputs[bad_node]))
+
+def read_node_output(id, max_bytes=1000):
+    """
+    Read pending stdout data for a node's cp_node SSH session.
+
+    The SSH pipes are placed in nonblocking mode. Using TextIOWrapper.read()
+    on such streams can return empty strings spuriously under load, so use
+    os.read on the underlying file descriptor instead.
+    """
+    fd = active_nodes[id].stdout.fileno()
+    try:
+        data = os.read(fd, max_bytes)
+    except BlockingIOError:
+        return None
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="replace")
 
 def start_nodes(r, options):
     """
@@ -1717,20 +1741,6 @@ def start_slowdown_plot(title, max_y, x_experiment, size=10,
     ax.set_ylabel(y_label, size=size)
     ax.grid(which="major", axis="y")
 
-    top_axis = ax.twiny()
-    top_axis.tick_params(axis="x", direction="in", length=5)
-    top_axis.set_xlim(0, 1.0)
-    top_ticks = []
-    top_labels = []
-    for x in range(0, 11, 2):
-        top_ticks.append(x/10.0)
-        top_labels.append("%d%%" % (x*10))
-    top_axis.set_xticks(top_ticks)
-    top_axis.set_xticklabels(top_labels, size=size)
-    if show_top_label:
-        top_axis.set_xlabel("Cumulative % of Messages", size=size)
-    top_axis.xaxis.set_label_position('top')
-
     if x_experiment != None: 
         # Generate x-axis labels
         ticks = []
@@ -1758,19 +1768,29 @@ def start_slowdown_plot(title, max_y, x_experiment, size=10,
         ax.set_xticks(ticks)
         ax.set_xticklabels(labels, size=size)
         if len(digest["counts"]) > 0:
+            total_messages = max(1, digest["total_messages"])
             left_edges = [0.0] + digest["cum_frac"][:-1]
             widths = [right - left for left, right in zip(left_edges,
                     digest["cum_frac"])]
+            hist_percent = [100.0 * count/total_messages
+                    for count in digest["counts"]]
             dist_axis = ax.twinx()
             dist_axis.set_xlim(0, 1.0)
-            dist_axis.set_ylim(0, max(digest["counts"]) * 1.05)
-            dist_axis.bar(left_edges, digest["counts"], width=widths,
-                    align="edge", color="0.88", edgecolor="none",
-                    alpha=0.35, zorder=0)
-            dist_axis.set_yticks([])
-            dist_axis.tick_params(right=False, labelright=False)
-            for spine in dist_axis.spines.values():
-                spine.set_visible(False)
+            dist_axis.set_ylim(0, max(hist_percent) * 1.05)
+            dist_axis.bar(left_edges, hist_percent, width=widths,
+                    align="edge", color="0.76", edgecolor="none",
+                    alpha=0.45, zorder=0)
+            dist_ticks = np.linspace(0, dist_axis.get_ylim()[1], 6)
+            dist_axis.set_yticks(dist_ticks)
+            dist_axis.set_yticklabels(["%.0f%%" % tick for tick in dist_ticks],
+                    size=size)
+            dist_axis.set_ylabel("Messages (%)", size=size)
+            dist_axis.tick_params(axis="y", direction="in", length=5,
+                    colors="0.35")
+            dist_axis.spines["right"].set_color("0.35")
+            dist_axis.spines["top"].set_visible(False)
+            dist_axis.spines["left"].set_visible(False)
+            dist_axis.spines["bottom"].set_visible(False)
             dist_axis.patch.set_alpha(0.0)
             ax.patch.set_alpha(0.0)
     return ax

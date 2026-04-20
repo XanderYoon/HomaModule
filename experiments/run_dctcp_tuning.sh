@@ -17,7 +17,7 @@ NODE0_ALIAS="${NODE0_ALIAS:-node0}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 NUM_NODES="${NUM_NODES:-10}"
-RUN_SECONDS="${RUN_SECONDS:-5}"
+RUN_SECONDS="${RUN_SECONDS:-10}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 CLIENT_MAX="${CLIENT_MAX:-200}"
 CLIENT_PORTS="${CLIENT_PORTS:-3}"
@@ -33,9 +33,9 @@ UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR_DEFAULT="$REPO_ROOT/experiments/results"
 LOCAL_RESULTS_DIR="$LOCAL_RESULTS_DIR_DEFAULT"
-WORKLOAD="${WORKLOAD:-}"
-GBPS="${GBPS:-0.0}"
-SERVER_COUNT="${SERVER_COUNT:-0}"
+WORKLOAD="${WORKLOAD:-w4}"
+GBPS="${GBPS:-20}"
+SERVER_COUNT="${SERVER_COUNT:-1}"
 RESULTS_RUN_ROOT=""
 
 usage() {
@@ -47,9 +47,9 @@ Optional:
                         empty means run the built-in workload set
   --gbps B              Override bandwidth for the workload
   --servers N           Layout: 0 means all nodes act as both clients
-                        and servers, 1 gives 1 server + 9 clients
-                        (default: 0)
-  --seconds S           Duration of each experiment phase (default: 5)
+                        and servers, 1 gives 1 server + 9 clients in the
+                        default 10-node setup (default: 1)
+  --seconds S           Duration of each experiment phase (default: 10)
   --seconds-multiplier M  Scale the run duration by this factor (default: 1)
   --client-max N        Maximum outstanding RPCs per client machine
   --client-ports N      Homa client ports baseline parameter
@@ -196,8 +196,8 @@ if [[ -n "$WORKLOAD" ]]; then
     WORKLOAD="$(normalize_workload "$WORKLOAD")"
 fi
 
-if [[ "$NUM_NODES" -ne 10 ]]; then
-    echo "This script is intended for 10 total nodes." >&2
+if (( NUM_NODES < 2 )); then
+    echo "--num-nodes must be at least 2" >&2
     exit 1
 fi
 
@@ -265,7 +265,7 @@ ssh "$NODE0_ALIAS" "
     cp cloudlab/bash_profile ~/.bash_profile
 "
 
-log setup "Authorizing node0 SSH key on node1 through node9"
+log setup "Authorizing node0 SSH key on node1 through node$((NUM_NODES-1))"
 NODE0_PUBKEY="$(ssh "$NODE0_ALIAS" "cat ~/.ssh/id_ed25519.pub")"
 for i in $(seq 1 $((NUM_NODES-1))); do
     ssh "node$i" "
@@ -279,7 +279,7 @@ for i in $(seq 1 $((NUM_NODES-1))); do
     "
 done
 
-log setup "Copying runtime files to node-0 through node-9"
+log setup "Copying runtime files to node-0 through node-$((NUM_NODES-1))"
 ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$NUM_NODES" <<'EOF'
 set -euo pipefail
 remote_repo_dir="$1"

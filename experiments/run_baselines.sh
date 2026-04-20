@@ -9,7 +9,7 @@ REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
 NUM_NODES="${NUM_NODES:-10}"
-RUN_SECONDS="${RUN_SECONDS:-5}"
+RUN_SECONDS="${RUN_SECONDS:-10}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 LINK_MBPS="${LINK_MBPS:-25000}"
 HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
@@ -35,7 +35,8 @@ WORKLOAD="${WORKLOAD:-}"
 GBPS="${GBPS:-0.0}"
 TCP="false"
 DCTCP="true"
-SERVER_COUNT="${SERVER_COUNT:-0}"
+SERVER_COUNT="${SERVER_COUNT:-1}"
+TCP_LOSS_PERCENT="${TCP_LOSS_PERCENT:-0.200}"
 
 usage() {
     cat <<'EOF'
@@ -47,8 +48,9 @@ Optional:
   --gbps B              Override bandwidth for the workload
   --servers N           cp_vs_tcp server layout: 0 means all nodes act as
                         both clients and servers, 1 gives 1 server + 9
-                        clients (default: 0)
-  --seconds S           Duration of each experiment phase (default: 5)
+                        clients in the default 10-node setup
+                        (default: 1)
+  --seconds S           Duration of each experiment phase (default: 10)
   --seconds-multiplier M  Scale the run duration by this factor (default: 1)
   --tcp BOOL            Run the regular TCP comparison too (default: false)
   --dctcp BOOL          Run the DCTCP comparison (default: true)
@@ -63,13 +65,14 @@ Optional:
 
 Environment overrides:
   CLOUDLAB_USER, REMOTE_REPO_DIR, REMOTE_COMPAT_REPO_LINK,
-  START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS
+  START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS,
+  TCP_LOSS_PERCENT
 
 Notes:
   - Run ssh_setup/ssh_setup_10nodes.sh first so node aliases and key-based SSH are configured.
-  - By default, this script uses the all-nodes cp_vs_tcp layout (`--servers 0`).
-  - Pass `--servers 1` to use the dedicated node-0 server and node-1..node-9
-    client layout.
+  - By default, this script uses the dedicated-server 10-node cp_vs_tcp layout
+    (`--servers 1`).
+  - Pass `--servers 0` to use the all-nodes layout instead.
   - The default startup path is 'generic', which discovers the active NIC
     and applies best-effort Homa setup for nodes that don't match the
     repo's xl170/m510-specific scripts.
@@ -173,8 +176,8 @@ if [[ -n "$WORKLOAD" ]]; then
     WORKLOAD="$(normalize_workload "$WORKLOAD")"
 fi
 
-if [[ "$NUM_NODES" -ne 10 ]]; then
-    echo "This script is intended for 10 total nodes." >&2
+if (( NUM_NODES < 2 )); then
+    echo "--num-nodes must be at least 2" >&2
     exit 1
 fi
 
@@ -197,19 +200,6 @@ LOG_DIR="$LOG_ROOT/baselines_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
 RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
 mkdir -p "$RESULTS_RUN_ROOT"
-HOSTS_FILE="$REPO_ROOT/ssh_setup/hosts_10.txt"
-
-if [[ ! -f "$HOSTS_FILE" ]]; then
-    echo "hosts_10.txt not found at $HOSTS_FILE" >&2
-    exit 1
-fi
-
-mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/' "$HOSTS_FILE")
-if [[ "${#HOSTS[@]}" -ne "$NUM_NODES" ]]; then
-    echo "Expected $NUM_NODES hosts in $HOSTS_FILE, found ${#HOSTS[@]}" >&2
-    exit 1
-fi
-
 log sync "Pushing updated cp_vs_tcp sources to $NODE0_ALIAS"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
     "$REPO_ROOT/util/cp_vs_tcp" \
@@ -250,7 +240,7 @@ ssh "$NODE0_ALIAS" "
     cp cloudlab/bash_profile ~/.bash_profile
 "
 
-log setup "Authorizing node0 SSH key on node1 through node9"
+log setup "Authorizing node0 SSH key on node1 through node$((NUM_NODES-1))"
 NODE0_PUBKEY="$(ssh "$NODE0_ALIAS" "cat ~/.ssh/id_ed25519.pub")"
 for i in $(seq 1 $((NUM_NODES-1))); do
     ssh "node$i" "
@@ -264,7 +254,7 @@ for i in $(seq 1 $((NUM_NODES-1))); do
     "
 done
 
-log setup "Copying runtime files to node-0 through node-9 and loading Homa with $START_SCRIPT"
+log setup "Copying runtime files to node-0 through node-$((NUM_NODES-1)) and loading Homa with $START_SCRIPT"
 ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$START_SCRIPT" "$NUM_NODES" \
     "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" "$HOMA_RTT_BYTES" \
     "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
@@ -350,7 +340,7 @@ INNER
 done
 EOF
 
-log setup "Refreshing Homa runtime on node-0 through node-9 before baselines"
+log setup "Refreshing Homa runtime on node-0 through node-$((NUM_NODES-1)) before baselines"
 ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" \
     "$HOMA_RTT_BYTES" "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
 set -euo pipefail
@@ -384,7 +374,7 @@ for i in $(seq 0 $((num_nodes-1))); do
 done
 EOF
 
-log setup "Validating private-network connectivity for node-0 through node-9"
+log setup "Validating private-network connectivity for node-0 through node-$((NUM_NODES-1))"
 ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" <<'EOF'
 set -euo pipefail
 num_nodes="$1"
@@ -417,7 +407,7 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --tcp-loss-percent $TCP_LOSS_PERCENT --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
 if [[ -n "$WORKLOAD" ]]; then
     CP_VS_TCP_CMD+=" -w $WORKLOAD"
 fi

@@ -8,7 +8,7 @@ REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
 NUM_NODES="${NUM_NODES:-10}"
-RUN_SECONDS="${RUN_SECONDS:-5}"
+RUN_SECONDS="${RUN_SECONDS:-10}"
 LINK_MBPS="${LINK_MBPS:-25000}"
 HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
 HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
@@ -27,9 +27,9 @@ UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-$REPO_ROOT/experiments/results}"
-WORKLOAD="${WORKLOAD:-}"
-GBPS="${GBPS:-0.0}"
-SERVER_COUNT="${SERVER_COUNT:-0}"
+WORKLOAD="${WORKLOAD:-w4}"
+GBPS="${GBPS:-20}"
+SERVER_COUNT="${SERVER_COUNT:-1}"
 RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/transport_vs_dctcp"
 
 usage() {
@@ -41,8 +41,9 @@ Optional:
                         empty means run the built-in workload set
   --gbps B              Override bandwidth for the workload
   --servers N           Transport layout: 0 means all nodes act as both clients
-                        and servers, 1 gives 1 server + 9 clients (default: 0)
-  --seconds S           Duration of each experiment phase (default: 5)
+                        and servers, 1 gives 1 server + 9 clients in the
+                        default 10-node setup (default: 1)
+  --seconds S           Duration of each experiment phase (default: 10)
   --link-mbps M         Homa link rate to configure on each node (default: 25000)
   --log-root DIR        Parent directory for benchmark logs (default: logs)
   --start-script NAME   Remote module start script, or 'generic'
@@ -150,8 +151,8 @@ require_cmd ssh
 require_cmd rsync
 require_cmd date
 
-if [[ "$NUM_NODES" -ne 10 ]]; then
-    echo "This script is intended for 10 total nodes." >&2
+if (( NUM_NODES < 2 )); then
+    echo "--num-nodes must be at least 2" >&2
     exit 1
 fi
 
