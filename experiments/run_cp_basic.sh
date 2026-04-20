@@ -109,16 +109,11 @@ ssh "$NODE0_ALIAS" "
         exit 1
     fi
 
-    need_pkgs=0
-    command -v ethtool >/dev/null 2>&1 || need_pkgs=1
-    command -v rsync >/dev/null 2>&1 || need_pkgs=1
-    command -v python3 >/dev/null 2>&1 || need_pkgs=1
-    command -v cpupower >/dev/null 2>&1 || need_pkgs=1
-    if [[ \$need_pkgs -eq 1 ]]; then
-        sudo apt-get update
-        sudo apt-get install -y python3 python3-numpy python3-matplotlib rsync ethtool linux-tools-common linux-tools-generic
-    fi
-
+    command -v ethtool >/dev/null 2>&1
+    command -v rsync >/dev/null 2>&1
+    command -v python3 >/dev/null 2>&1
+    command -v cpupower >/dev/null 2>&1
+    python3 -c 'import matplotlib, numpy' >/dev/null 2>&1
     test -x ~/bin/cp_node
     test -x ~/bin/homa_prio
     test -f /tmp/homa_node_hosts
@@ -192,15 +187,11 @@ for i in $(seq 0 $((num_nodes-1))); do
         mkdir -p ~/bin ~/.ssh
         chmod 700 ~/.ssh
 
-        need_pkgs=0
-        command -v ethtool >/dev/null 2>&1 || need_pkgs=1
-        command -v rsync >/dev/null 2>&1 || need_pkgs=1
-        command -v python3 >/dev/null 2>&1 || need_pkgs=1
-        command -v cpupower >/dev/null 2>&1 || need_pkgs=1
-        if [[ \$need_pkgs -eq 1 ]]; then
-            sudo apt-get update
-            sudo apt-get install -y python3 rsync ethtool linux-tools-common linux-tools-generic linux-tools-\$(uname -r)
-        fi
+        command -v ethtool >/dev/null 2>&1
+        command -v rsync >/dev/null 2>&1
+        command -v python3 >/dev/null 2>&1
+        command -v cpupower >/dev/null 2>&1
+        python3 -c 'import matplotlib, numpy' >/dev/null 2>&1
     "
 
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \

@@ -175,6 +175,7 @@ prepare_node0() {
         command -v ethtool >/dev/null 2>&1 || need_pkgs=1
         command -v python3 >/dev/null 2>&1 || need_pkgs=1
         command -v cpupower >/dev/null 2>&1 || need_pkgs=1
+        python3 -c 'import matplotlib, numpy' >/dev/null 2>&1 || need_pkgs=1
         if [[ \$need_pkgs -eq 1 ]]; then
             sudo apt-get update
             sudo apt-get install -y \
@@ -384,10 +385,12 @@ for i in $(seq 0 $((num_nodes-1))); do
         command -v ethtool >/dev/null 2>&1 || need_pkgs=1
         command -v python3 >/dev/null 2>&1 || need_pkgs=1
         command -v cpupower >/dev/null 2>&1 || need_pkgs=1
+        python3 -c 'import matplotlib, numpy' >/dev/null 2>&1 || need_pkgs=1
         if [[ \$need_pkgs -eq 1 ]]; then
             sudo apt-get update
             sudo apt-get install -y \
-                rsync ethtool python3 linux-tools-common linux-tools-generic \
+                rsync ethtool python3 python3-numpy python3-matplotlib \
+                linux-tools-common linux-tools-generic \
                 linux-tools-\$(uname -r)
         fi
     "
