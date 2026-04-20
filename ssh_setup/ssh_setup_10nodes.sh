@@ -4,37 +4,86 @@ set -euo pipefail
 LOCAL_USER="$(whoami)"
 REMOTE_USER="${CLOUDLAB_USER:-$LOCAL_USER}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOSTS_FILE="$SCRIPT_DIR/hosts_10.txt"
+
 SSH_DIR="$HOME/.ssh"
 CONFIG_DIR="$SSH_DIR/config.d"
 LOCAL_CONFIG_FILE="$CONFIG_DIR/cloudlab"
-REPO_URL="${HOMA_REPO_URL:-https://github.com/XanderYoon/HomaModule.git}"
-REPO_BRANCH="${HOMA_REPO_BRANCH:-main}"
-REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-\$HOME/HomaModule}"
-NODE0_ALIAS="node0"
+
+NODE0_ALIAS="${NODE0_ALIAS:-node0}"
+REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
+REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
+
+REPO_URL="${HOMA_REPO_URL:-https://github.com/PlatformLab/HomaModule.git}"
+REPO_BRANCH="${HOMA_REPO_BRANCH:-}"
+
+START_SCRIPT="${START_SCRIPT:-start_xl170}"
+NUM_NODES=10
+LINK_MBPS="${LINK_MBPS:-25000}"
+HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
+HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
+HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
+HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
+HOMA_NUM_PRIORITIES="${HOMA_NUM_PRIORITIES:-8}"
+HOMA_POLL_USECS="${HOMA_POLL_USECS:-50}"
+
+PAPER_MODE="${PAPER_MODE:-true}"
+PAPER_EXPECT_XL170="${PAPER_EXPECT_XL170:-true}"
+PAPER_MTU="${PAPER_MTU:-1500}"
+MGMT_IFACE="${MGMT_IFACE:-eno49}"
+MGMT_MTU="${MGMT_MTU:-1500}"
+PRIVATE_IFACE="${PRIVATE_IFACE:-ens1f1}"
+RPS_SOCK_FLOW_ENTRIES="${RPS_SOCK_FLOW_ENTRIES:-32768}"
+RPS_FLOW_CNT="${RPS_FLOW_CNT:-2048}"
+RPS_CPUS_MASK="${RPS_CPUS_MASK:-fffff}"
+TCP_FASTOPEN="${TCP_FASTOPEN:-0}"
+
+SWITCH_CONFIG_OUT="${SWITCH_CONFIG_OUT:-$REPO_ROOT/experiments/results/paper_switch_config.txt}"
 
 log() {
     printf '\n[%s] %s\n' "$1" "$2"
 }
 
+usage() {
+    cat <<EOF
+Usage:
+  CLOUDLAB_USER=<cloudlab-user> bash ssh_setup/ssh_setup_10nodes.sh
+
+Common examples:
+  Default safe MTU 1500:
+    CLOUDLAB_USER=ARY bash ssh_setup/ssh_setup_10nodes.sh
+
+  Later, when the private experiment LAN supports jumbo frames:
+    PAPER_MTU=3000 CLOUDLAB_USER=ARY bash ssh_setup/ssh_setup_10nodes.sh
+
+Environment knobs:
+  CLOUDLAB_USER   Remote username for all CloudLab nodes
+  PAPER_MTU       MTU for the private experiment NIC ($PRIVATE_IFACE), default: $PAPER_MTU
+  MGMT_MTU        MTU for the management NIC ($MGMT_IFACE), default: $MGMT_MTU
+  PRIVATE_IFACE   Private experiment NIC, default: $PRIVATE_IFACE
+  MGMT_IFACE      Management NIC, default: $MGMT_IFACE
+EOF
+}
+
 require_cmd() {
-    if ! command -v "$1" >/dev/null 2>&1; then
+    command -v "$1" >/dev/null 2>&1 || {
         echo "Missing required command: $1" >&2
         exit 1
-    fi
+    }
 }
 
 read_hosts() {
-    if [[ ! -f "$HOSTS_FILE" ]]; then
+    [[ -f "$HOSTS_FILE" ]] || {
         echo "hosts_10.txt not found at $HOSTS_FILE" >&2
         exit 1
-    fi
+    }
 
     mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/' "$HOSTS_FILE")
-    if [[ "${#HOSTS[@]}" -ne 10 ]]; then
-        echo "Expected exactly 10 hosts in $HOSTS_FILE, found ${#HOSTS[@]}" >&2
+    [[ "${#HOSTS[@]}" -eq "$NUM_NODES" ]] || {
+        echo "Expected exactly $NUM_NODES hosts in $HOSTS_FILE, found ${#HOSTS[@]}" >&2
         exit 1
-    fi
+    }
 }
 
 ensure_local_key() {
@@ -58,287 +107,752 @@ Host node$i node-$i cloudlab-node$i cloudlab-node-$i
     User $REMOTE_USER
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
+    ConnectTimeout 15
+    ServerAliveInterval 10
+    ServerAliveCountMax 3
 
 EOF
     done
 
     touch "$SSH_DIR/config"
-    if ! grep -Fqx "Include $CONFIG_DIR/*" "$SSH_DIR/config"; then
+    grep -qxF "Include $CONFIG_DIR/*" "$SSH_DIR/config" 2>/dev/null || \
         printf 'Include %s/*\n' "$CONFIG_DIR" >>"$SSH_DIR/config"
-    fi
 }
 
 install_local_key_on_nodes() {
+    local pubkey
+    pubkey="$(cat "$SSH_DIR/id_ed25519.pub")"
+
     for i in "${!HOSTS[@]}"; do
-        log "local-ssh" "Installing local SSH key on node$i (${HOSTS[$i]})"
-        ssh-copy-id -o StrictHostKeyChecking=no "$REMOTE_USER@${HOSTS[$i]}"
+        log local-ssh "Installing local SSH key on node$i (${HOSTS[$i]})"
+        ssh "$REMOTE_USER@${HOSTS[$i]}" "
+            set -euo pipefail
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            touch ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            grep -qxF '$pubkey' ~/.ssh/authorized_keys 2>/dev/null || \
+                printf '%s\n' '$pubkey' >> ~/.ssh/authorized_keys
+        "
     done
 }
 
 verify_local_connectivity() {
     for i in "${!HOSTS[@]}"; do
-        log "local-verify" "Verifying local SSH to node$i"
+        log local-verify "Verifying local SSH to node$i"
         ssh "node$i" "hostname"
     done
 }
 
-prepare_node0_ssh() {
-    log "node0-ssh" "Preparing SSH key and config on node0"
-    ssh "$NODE0_ALIAS" '
+prepare_node0() {
+    log node0 "Preparing node0 build and runtime environment on $NODE0_ALIAS"
+    ssh "$NODE0_ALIAS" "
         set -euo pipefail
-        mkdir -p ~/.ssh ~/.ssh/config.d
+        mkdir -p ~/.ssh ~/.ssh/config.d ~/bin
         chmod 700 ~/.ssh
-        if [[ ! -f ~/.ssh/id_ed25519 ]]; then
-            ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
-        fi
-    '
 
-    ssh "$NODE0_ALIAS" "cat > ~/.ssh/config.d/cloudlab" <<EOF
-# Auto-generated by ssh_setup/ssh_setup_10nodes.sh
+        if [[ ! -f ~/.ssh/id_ed25519 ]]; then
+            ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ''
+        fi
+
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        grep -qxF \"\$(cat ~/.ssh/id_ed25519.pub)\" ~/.ssh/authorized_keys 2>/dev/null || \
+            cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+
+        touch ~/.ssh/config
+        grep -qxF 'Include ~/.ssh/config.d/*' ~/.ssh/config 2>/dev/null || \
+            printf 'Include ~/.ssh/config.d/*\n' >> ~/.ssh/config
+        rm -f ~/.ssh/config.d/cloudlab ~/.ssh/config.d/homa_private \
+            ~/.ssh/config.d/00-cloudlab-mgmt ~/.ssh/config.d/10-homa-private
+
+        need_pkgs=0
+        command -v git >/dev/null 2>&1 || need_pkgs=1
+        command -v make >/dev/null 2>&1 || need_pkgs=1
+        command -v gcc >/dev/null 2>&1 || need_pkgs=1
+        command -v g++ >/dev/null 2>&1 || need_pkgs=1
+        command -v rsync >/dev/null 2>&1 || need_pkgs=1
+        command -v ethtool >/dev/null 2>&1 || need_pkgs=1
+        command -v python3 >/dev/null 2>&1 || need_pkgs=1
+        command -v cpupower >/dev/null 2>&1 || need_pkgs=1
+        if [[ \$need_pkgs -eq 1 ]]; then
+            sudo apt-get update
+            sudo apt-get install -y \
+                git make gcc g++ rsync ethtool python3 python3-numpy python3-matplotlib \
+                linux-tools-common linux-tools-generic \"linux-tools-\$(uname -r)\"
+        fi
+
+        requested_branch='$REPO_BRANCH'
+        resolved_branch=''
+        if [[ -n \"\$requested_branch\" ]]; then
+            resolved_branch=\"\$requested_branch\"
+        else
+            resolved_branch=\"\$(git ls-remote --symref $REPO_URL HEAD 2>/dev/null | awk '/^ref:/ {sub(\"refs/heads/\", \"\", \$2); print \$2; exit}')\"
+            if [[ -z \"\$resolved_branch\" ]]; then
+                resolved_branch=master
+            fi
+        fi
+
+        if [[ -d $REMOTE_REPO_DIR/.git ]]; then
+            git -C $REMOTE_REPO_DIR fetch origin
+            if git -C $REMOTE_REPO_DIR show-ref --verify --quiet refs/remotes/origin/\$resolved_branch; then
+                git -C $REMOTE_REPO_DIR checkout \$resolved_branch
+                git -C $REMOTE_REPO_DIR pull --ff-only origin \$resolved_branch || true
+            else
+                current_branch=\"\$(git -C $REMOTE_REPO_DIR rev-parse --abbrev-ref HEAD)\"
+                echo \"Requested/default branch '\$resolved_branch' is not present in existing clone; keeping current branch '\$current_branch'\" >&2
+                resolved_branch=\"\$current_branch\"
+            fi
+        else
+            git clone --branch \$resolved_branch $REPO_URL $REMOTE_REPO_DIR
+        fi
+
+        ln -sfn $REMOTE_REPO_DIR $REMOTE_COMPAT_REPO_LINK
+
+        cd $REMOTE_REPO_DIR
+        make -j
+        make -C util -j
+
+        cp cloudlab/bin/* ~/bin/
+        /usr/bin/install -m 755 $REMOTE_REPO_DIR/homa.ko ~/bin/homa.ko
+        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
+        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
+        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/*.py ~/bin/
+        chmod +x ~/bin/*
+
+        cp cloudlab/bashrc ~/.bashrc
+        cp cloudlab/bash_profile ~/.bash_profile
+    "
+
+    ssh "$NODE0_ALIAS" "cat > ~/.ssh/config.d/00-cloudlab-mgmt" <<EOF
+# Auto-generated management-network aliases for CloudLab nodes
 EOF
 
     for i in "${!HOSTS[@]}"; do
-        ssh "$NODE0_ALIAS" "cat >> ~/.ssh/config.d/cloudlab" <<EOF
-Host node$i node-$i cloudlab-node$i cloudlab-node-$i
+        ssh "$NODE0_ALIAS" "cat >> ~/.ssh/config.d/00-cloudlab-mgmt" <<EOF
+Host node$i
     HostName ${HOSTS[$i]}
     User $REMOTE_USER
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
+    ConnectTimeout 15
+    ServerAliveInterval 10
+    ServerAliveCountMax 3
 
 EOF
     done
 
-    ssh "$NODE0_ALIAS" '
-        set -euo pipefail
-        touch ~/.ssh/config
-        if ! grep -Fqx "Include ~/.ssh/config.d/*" ~/.ssh/config; then
-            printf "Include ~/.ssh/config.d/*\n" >> ~/.ssh/config
-        fi
-        chmod 600 ~/.ssh/config ~/.ssh/config.d/cloudlab
-    '
+    ssh "$NODE0_ALIAS" "chmod 600 ~/.ssh/config.d/00-cloudlab-mgmt"
 }
 
-install_node0_key_on_peers() {
+authorize_node0_key_on_peers() {
     local node0_pubkey
     node0_pubkey="$(ssh "$NODE0_ALIAS" "cat ~/.ssh/id_ed25519.pub")"
 
-    for i in $(seq 1 9); do
-        log "node0-key" "Authorizing node0 SSH key on node$i"
+    log node0-key "Authorizing node0 SSH key on node0 through node9"
+    for i in "${!HOSTS[@]}"; do
         ssh "node$i" "
             set -euo pipefail
             mkdir -p ~/.ssh
             chmod 700 ~/.ssh
             touch ~/.ssh/authorized_keys
             chmod 600 ~/.ssh/authorized_keys
-            if ! grep -Fqx '$node0_pubkey' ~/.ssh/authorized_keys; then
+            grep -qxF '$node0_pubkey' ~/.ssh/authorized_keys 2>/dev/null || \
                 printf '%s\n' '$node0_pubkey' >> ~/.ssh/authorized_keys
-            fi
         "
     done
 }
 
-verify_node0_connectivity() {
-    for i in $(seq 1 9); do
-        log "node0-verify" "Verifying node0 SSH to node$i"
-        ssh "$NODE0_ALIAS" "ssh node$i hostname"
+bootstrap_private_aliases_on_node0() {
+    log node0-net "Bootstrapping private-IP aliases on $NODE0_ALIAS"
+    local hosts_tmp private_tmp
+    hosts_tmp="$(mktemp)"
+    private_tmp="$(mktemp)"
+
+    for i in "${!HOSTS[@]}"; do
+        local private_ip
+        private_ip="$(ssh "node$i" "hostname -I | tr ' ' '\n' | grep -E '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.)' | head -n1")"
+        if [[ -z "$private_ip" ]]; then
+            rm -f "$hosts_tmp" "$private_tmp"
+            echo "Couldn't determine private IPv4 address for node$i" >&2
+            exit 1
+        fi
+        printf '%s node-%d node%d\n' "$private_ip" "$i" "$i" >>"$hosts_tmp"
+        printf 'node-%d %s\n' "$i" "$private_ip" >>"$private_tmp"
     done
+
+    ssh "$NODE0_ALIAS" "mkdir -p ~/.ssh/config.d"
+    ssh "$NODE0_ALIAS" "cat > /tmp/homa_node_hosts" <"$hosts_tmp"
+    ssh "$NODE0_ALIAS" "cat > /tmp/homa_node_private_map" <"$private_tmp"
+    rm -f "$hosts_tmp" "$private_tmp"
+
+    ssh "$NODE0_ALIAS" bash -s <<'EOF'
+set -euo pipefail
+
+rm -f ~/.ssh/config.d/homa_private
+cat > ~/.ssh/config.d/10-homa-private <<CFG
+# Auto-generated private-network aliases for Homa experiments
+CFG
+
+while read -r alias ip; do
+    cat >> ~/.ssh/config.d/10-homa-private <<CFG
+Host $alias
+    HostName $ip
+    User $(whoami)
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ConnectTimeout 15
+    ServerAliveInterval 10
+    ServerAliveCountMax 3
+
+CFG
+done < /tmp/homa_node_private_map
+
+chmod 600 ~/.ssh/config.d/10-homa-private
+EOF
 }
 
-setup_homa_on_node0() {
-    log "node0-homa" "Installing packages on node0"
-    ssh "$NODE0_ALIAS" '
-        set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y git make gcc g++ openssh-client ethtool python3
-    '
+distribute_runtime_and_configure_nodes() {
+    log setup "Distributing runtime, hosts file, and paper-style node tuning"
+    ssh "$NODE0_ALIAS" bash -s -- \
+        "$REMOTE_REPO_DIR" \
+        "$START_SCRIPT" \
+        "$NUM_NODES" \
+        "$LINK_MBPS" \
+        "$HOMA_MAX_NIC_QUEUE_NS" \
+        "$HOMA_RTT_BYTES" \
+        "$HOMA_GRANT_INCREMENT" \
+        "$HOMA_MAX_GSO_SIZE" \
+        "$HOMA_NUM_PRIORITIES" \
+        "$HOMA_POLL_USECS" \
+        "$PAPER_MODE" \
+        "$PAPER_EXPECT_XL170" \
+        "$PAPER_MTU" \
+        "$MGMT_IFACE" \
+        "$MGMT_MTU" \
+        "$PRIVATE_IFACE" \
+        "$RPS_SOCK_FLOW_ENTRIES" \
+        "$RPS_FLOW_CNT" \
+        "$RPS_CPUS_MASK" \
+        "$TCP_FASTOPEN" <<'EOF'
+set -euo pipefail
 
-    log "node0-homa" "Cloning or updating Homa repo on node0"
-    ssh "$NODE0_ALIAS" "
+remote_repo_dir="$1"
+start_script="$2"
+num_nodes="$3"
+link_mbps="$4"
+max_nic_queue_ns="$5"
+rtt_bytes="$6"
+grant_increment="$7"
+max_gso_size="$8"
+num_priorities="$9"
+poll_usecs="${10}"
+paper_mode="${11}"
+paper_expect_xl170="${12}"
+paper_mtu="${13}"
+mgmt_iface="${14}"
+mgmt_mtu="${15}"
+private_iface="${16}"
+rps_sock_flow_entries="${17}"
+rps_flow_cnt="${18}"
+rps_cpus_mask="${19}"
+tcp_fastopen="${20}"
+
+case "$remote_repo_dir" in
+    "~")
+        remote_repo_dir="$HOME"
+        ;;
+    "~/"*)
+        remote_repo_dir="$HOME/${remote_repo_dir#~/}"
+        ;;
+esac
+
+cd "$remote_repo_dir"
+node0_pubkey="$(cat ~/.ssh/id_ed25519.pub)"
+
+for i in $(seq 0 $((num_nodes-1))); do
+    node="node-$i"
+    echo "=== $node ==="
+
+    ssh "$node" "
         set -euo pipefail
-        if [[ -d $REMOTE_REPO_DIR/.git ]]; then
-            git -C $REMOTE_REPO_DIR fetch origin $REPO_BRANCH
-            git -C $REMOTE_REPO_DIR checkout $REPO_BRANCH
-            git -C $REMOTE_REPO_DIR reset --hard origin/$REPO_BRANCH
-        else
-            rm -rf -- $REMOTE_REPO_DIR
-            git clone --branch $REPO_BRANCH $REPO_URL $REMOTE_REPO_DIR
+        mkdir -p ~/bin ~/.ssh
+        chmod 700 ~/.ssh
+
+        need_pkgs=0
+        command -v rsync >/dev/null 2>&1 || need_pkgs=1
+        command -v ethtool >/dev/null 2>&1 || need_pkgs=1
+        command -v python3 >/dev/null 2>&1 || need_pkgs=1
+        command -v cpupower >/dev/null 2>&1 || need_pkgs=1
+        if [[ \$need_pkgs -eq 1 ]]; then
+            sudo apt-get update
+            sudo apt-get install -y \
+                rsync ethtool python3 linux-tools-common linux-tools-generic \
+                linux-tools-\$(uname -r)
         fi
     "
 
-    log "node0-homa" "Building Homa utilities on node0"
-    ssh "$NODE0_ALIAS" "
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+        ~/.bashrc ~/.bash_profile "$node:"
+
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+        ~/bin/ "$node:~/bin/"
+
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+        homa.ko util/cp_node util/homa_prio util/*.py "$node:~/bin/"
+
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rt \
+        /tmp/homa_node_hosts "$node:/tmp/homa_node_hosts"
+
+    ssh "$node" "
         set -euo pipefail
-        cd $REMOTE_REPO_DIR/util
-        make clean
-        make
-        mkdir -p ~/bin
-        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
-        /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        grep -qxF '$node0_pubkey' ~/.ssh/authorized_keys 2>/dev/null || \
+            printf '%s\n' '$node0_pubkey' >> ~/.ssh/authorized_keys
+
+        sudo /usr/bin/install -m 755 ~/bin/cp_node /usr/bin/cp_node
+        sudo /usr/bin/install -m 755 ~/bin/homa_prio /usr/bin/homa_prio
+        sudo /usr/bin/install -m 755 ~/bin/*.py /usr/bin/
+
+        sudo sed -i '/ node-[0-9]\b/d;/ node[0-9]\b/d' /etc/hosts
+        cat /tmp/homa_node_hosts | sudo tee -a /etc/hosts >/dev/null
     "
+
+    ssh "$node" bash -s -- \
+        "$mgmt_iface" \
+        "$mgmt_mtu" \
+        "$private_iface" \
+        "$paper_mode" \
+        "$paper_expect_xl170" \
+        "$paper_mtu" \
+        "$link_mbps" \
+        "$max_nic_queue_ns" \
+        "$rtt_bytes" \
+        "$grant_increment" \
+        "$max_gso_size" \
+        "$num_priorities" \
+        "$poll_usecs" \
+        "$rps_sock_flow_entries" \
+        "$rps_flow_cnt" \
+        "$rps_cpus_mask" \
+        "$tcp_fastopen" <<'INNER'
+set -euo pipefail
+
+mgmt_iface="$1"
+mgmt_mtu="$2"
+iface="$3"
+paper_mode="$4"
+paper_expect_xl170="$5"
+paper_mtu="$6"
+link_mbps="$7"
+max_nic_queue_ns="$8"
+rtt_bytes="$9"
+grant_increment="${10}"
+max_gso_size="${11}"
+num_priorities="${12}"
+poll_usecs="${13}"
+rps_sock_flow_entries="${14}"
+rps_flow_cnt="${15}"
+rps_cpus_mask="${16}"
+tcp_fastopen="${17}"
+
+if [[ -d /sys/class/net/$mgmt_iface ]]; then
+    sudo ip link set dev "$mgmt_iface" mtu "$mgmt_mtu"
+fi
+
+if [[ ! -d /sys/class/net/$iface ]]; then
+    echo "Expected experiment interface $iface is missing" >&2
+    exit 1
+fi
+
+if [[ "$paper_expect_xl170" == "true" ]]; then
+    cpu_model="$(lscpu | awk -F: '/Model name:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+    nic_driver="$(ethtool -i "$iface" 2>/dev/null | awk -F: '/driver:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+    nic_speed="$(ethtool "$iface" 2>/dev/null | awk -F: '/Speed:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+    if [[ "$cpu_model" != *"E5-2640 v4"* && "$cpu_model" != *"E5-2640v4"* ]]; then
+        echo "Unexpected CPU model for xl170 reproduction: $cpu_model" >&2
+        exit 1
+    fi
+    if [[ "$nic_driver" != "mlx5_core" ]]; then
+        echo "Unexpected NIC driver for xl170 reproduction: $nic_driver" >&2
+        exit 1
+    fi
+    if [[ "$nic_speed" != "25000Mb/s" ]]; then
+        echo "Unexpected NIC speed for xl170 reproduction: $nic_speed" >&2
+        exit 1
+    fi
+fi
+
+if [[ "$paper_mode" == "true" ]]; then
+    sudo ip link set dev "$iface" mtu "$paper_mtu"
+fi
+
+sudo modprobe tcp_dctcp >/dev/null 2>&1 || true
+sudo sysctl -w net.ipv4.tcp_ecn=1 >/dev/null
+sudo sysctl -w net.ipv4.tcp_congestion_control=dctcp >/dev/null
+sudo sysctl -w net.ipv4.tcp_fastopen="$tcp_fastopen" >/dev/null
+
+sudo pkill cp_node >/dev/null 2>&1 || true
+sudo pkill homa_prio >/dev/null 2>&1 || true
+sudo rmmod homa >/dev/null 2>&1 || true
+sudo insmod ~/bin/homa.ko
+
+sudo sysctl -w net.homa.link_mbps="$link_mbps" >/dev/null
+sudo sysctl -w net.homa.max_nic_queue_ns="$max_nic_queue_ns" >/dev/null
+sudo sysctl -w net.homa.rtt_bytes="$rtt_bytes" >/dev/null
+sudo sysctl -w net.homa.grant_increment="$grant_increment" >/dev/null
+sudo sysctl -w net.homa.max_gso_size="$max_gso_size" >/dev/null
+sudo sysctl -w net.homa.num_priorities="$num_priorities" >/dev/null
+sudo sysctl -w net.homa.poll_usecs="$poll_usecs" >/dev/null || true
+
+if command -v cpupower >/dev/null 2>&1; then
+    sudo cpupower frequency-set -g performance >/dev/null 2>&1 || true
+fi
+
+for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [[ -e "$f" ]] || continue
+    printf 'performance\n' | sudo tee "$f" >/dev/null || true
+done
+
+sudo ethtool -K "$iface" tso on gso on gro on >/dev/null 2>&1 || true
+sudo ethtool -K "$iface" ntuple on >/dev/null 2>&1 || true
+sudo ethtool -C "$iface" adaptive-rx off rx-usecs 0 rx-frames 0 tx-usecs 0 tx-frames 0 >/dev/null 2>&1 || true
+sudo ethtool -L "$iface" combined "$(nproc)" >/dev/null 2>&1 || true
+
+rm -f ~/.homa_metrics
+sudo sysctl -w net.core.rps_sock_flow_entries="$rps_sock_flow_entries" >/dev/null
+
+for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+    [[ -e "$f" ]] || continue
+    printf '%s\n' "$rps_flow_cnt" | sudo tee "$f" >/dev/null || true
+done
+
+for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+    [[ -e "$f" ]] || continue
+    printf '%s\n' "$rps_cpus_mask" | sudo tee "$f" >/dev/null || true
+done
+INNER
+done
+EOF
 }
 
-verify_homa_on_node0() {
-    log "node0-homa" "Verifying Homa utilities on node0"
-    ssh "$NODE0_ALIAS" "
-        set -euo pipefail
-        test -x $REMOTE_REPO_DIR/util/cp_node
-        test -x $REMOTE_REPO_DIR/util/homa_prio
-        printf 'Remote repo: %s\n' $REMOTE_REPO_DIR
-        printf 'cp_node: %s\n' $REMOTE_REPO_DIR/util/cp_node
-        printf 'homa_prio: %s\n' $REMOTE_REPO_DIR/util/homa_prio
-    "
+verify_node0_private_connectivity() {
+    log verify "Checking node0 fanout SSH and private-network connectivity"
+    ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" <<'EOF'
+set -euo pipefail
+
+num_nodes="$1"
+for i in $(seq 0 $((num_nodes-1))); do
+    node="node-$i"
+    ssh "$node" "hostname >/dev/null"
+    if [[ "$node" != "node-0" ]]; then
+        ssh "$node" "ping -c 1 -W 1 node-0 >/dev/null"
+    fi
+done
+EOF
 }
 
-configure_dctcp() {
-    for i in "${!HOSTS[@]}"; do
-        log "dctcp" "Configuring DCTCP on node$i"
-        ssh "node$i" '
-            set -euo pipefail
-            sudo modprobe tcp_dctcp
-            sudo sysctl -w net.ipv4.tcp_ecn=1
-            sudo sysctl -w net.ipv4.tcp_congestion_control=dctcp
-            sudo sysctl -w net.ipv4.tcp_fastopen=0
-        '
-    done
+verify_cluster_setup() {
+    log verify "Validating paper-style host tuning and runtime on node-0 through node-9"
+    ssh "$NODE0_ALIAS" bash -s -- \
+        "$NUM_NODES" \
+        "$PAPER_MODE" \
+        "$PAPER_EXPECT_XL170" \
+        "$PAPER_MTU" \
+        "$MGMT_IFACE" \
+        "$MGMT_MTU" \
+        "$PRIVATE_IFACE" \
+        "$RPS_SOCK_FLOW_ENTRIES" \
+        "$RPS_FLOW_CNT" \
+        "$RPS_CPUS_MASK" \
+        "$LINK_MBPS" \
+        "$HOMA_MAX_NIC_QUEUE_NS" \
+        "$HOMA_RTT_BYTES" \
+        "$HOMA_GRANT_INCREMENT" \
+        "$HOMA_MAX_GSO_SIZE" \
+        "$HOMA_NUM_PRIORITIES" \
+        "$TCP_FASTOPEN" <<'EOF'
+set -euo pipefail
+
+num_nodes="$1"
+paper_mode="$2"
+paper_expect_xl170="$3"
+paper_mtu="$4"
+mgmt_iface="$5"
+mgmt_mtu="$6"
+iface="$7"
+rps_sock_flow_entries="$8"
+rps_flow_cnt="$9"
+rps_cpus_mask="${10}"
+link_mbps="${11}"
+max_nic_queue_ns="${12}"
+rtt_bytes="${13}"
+grant_increment="${14}"
+max_gso_size="${15}"
+num_priorities="${16}"
+tcp_fastopen="${17}"
+
+for i in $(seq 0 $((num_nodes-1))); do
+    node="node-$i"
+
+    ssh "$node" bash -s -- \
+        "$node" \
+        "$paper_mode" \
+        "$paper_expect_xl170" \
+        "$paper_mtu" \
+        "$mgmt_iface" \
+        "$mgmt_mtu" \
+        "$iface" \
+        "$rps_sock_flow_entries" \
+        "$rps_flow_cnt" \
+        "$rps_cpus_mask" \
+        "$link_mbps" \
+        "$max_nic_queue_ns" \
+        "$rtt_bytes" \
+        "$grant_increment" \
+        "$max_gso_size" \
+        "$num_priorities" \
+        "$tcp_fastopen" <<'INNER'
+set -euo pipefail
+
+node_name="$1"
+paper_mode="$2"
+paper_expect_xl170="$3"
+paper_mtu="$4"
+mgmt_iface="$5"
+mgmt_mtu="$6"
+iface="$7"
+rps_sock_flow_entries="$8"
+rps_flow_cnt="$9"
+rps_cpus_mask="${10}"
+link_mbps="${11}"
+max_nic_queue_ns="${12}"
+rtt_bytes="${13}"
+grant_increment="${14}"
+max_gso_size="${15}"
+num_priorities="${16}"
+tcp_fastopen="${17}"
+
+if [[ ! -d /sys/class/net/$iface ]]; then
+    echo "$node_name: expected interface $iface is missing" >&2
+    exit 1
+fi
+
+if [[ "$paper_expect_xl170" == "true" ]]; then
+    cpu_model="$(lscpu | awk -F: '/Model name:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+    nic_driver="$(ethtool -i "$iface" 2>/dev/null | awk -F: '/driver:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+    nic_speed="$(ethtool "$iface" 2>/dev/null | awk -F: '/Speed:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+    if [[ "$cpu_model" != *"E5-2640 v4"* && "$cpu_model" != *"E5-2640v4"* ]]; then
+        echo "$node_name: unexpected CPU model '$cpu_model'" >&2
+        exit 1
+    fi
+    if [[ "$nic_driver" != "mlx5_core" ]]; then
+        echo "$node_name: unexpected NIC driver '$nic_driver'" >&2
+        exit 1
+    fi
+    if [[ "$nic_speed" != "25000Mb/s" ]]; then
+        echo "$node_name: NIC speed is '$nic_speed', expected 25000Mb/s" >&2
+        exit 1
+    fi
+fi
+
+if [[ "$paper_mode" == "true" ]]; then
+    mtu="$(ip -o link show "$iface" | awk '{for (i = 1; i <= NF; i++) if ($i == "mtu") {print $(i+1); exit}}')"
+    if [[ "$mtu" != "$paper_mtu" ]]; then
+        echo "$node_name: MTU is '$mtu', expected '$paper_mtu'" >&2
+        exit 1
+    fi
+fi
+
+if [[ -d /sys/class/net/$mgmt_iface ]]; then
+    mgmt_link_mtu="$(ip -o link show "$mgmt_iface" | awk '{for (i = 1; i <= NF; i++) if ($i == "mtu") {print $(i+1); exit}}')"
+    if [[ "$mgmt_link_mtu" != "$mgmt_mtu" ]]; then
+        echo "$node_name: management MTU is '$mgmt_link_mtu', expected '$mgmt_mtu'" >&2
+        exit 1
+    fi
+fi
+
+lsmod | grep -q '^homa' || {
+    echo "$node_name: Homa module is not loaded" >&2
+    exit 1
 }
 
-verify_dctcp() {
-    for i in "${!HOSTS[@]}"; do
-        log "dctcp-verify" "Verifying DCTCP on node$i"
-        ssh "node$i" '
-            set -euo pipefail
-            node_name="$(hostname)"
-            ecn="$(sysctl -n net.ipv4.tcp_ecn)"
-            cc="$(sysctl -n net.ipv4.tcp_congestion_control)"
-            tfo="$(sysctl -n net.ipv4.tcp_fastopen)"
-            [[ "$ecn" == "1" ]] || { echo "$node_name: tcp_ecn=$ecn, expected 1" >&2; exit 1; }
-            [[ "$cc" == "dctcp" ]] || { echo "$node_name: tcp_congestion_control=$cc, expected dctcp" >&2; exit 1; }
-            [[ "$tfo" == "0" ]] || { echo "$node_name: tcp_fastopen=$tfo, expected 0" >&2; exit 1; }
-            printf "%s: DCTCP OK\n" "$node_name"
-        '
-    done
+test -x ~/bin/cp_node || {
+    echo "$node_name: ~/bin/cp_node is missing" >&2
+    exit 1
+}
+test -x /usr/bin/cp_node || {
+    echo "$node_name: /usr/bin/cp_node is missing" >&2
+    exit 1
 }
 
-configure_xl170_paper_hardware() {
-    for i in "${!HOSTS[@]}"; do
-        log "xl170-tuning" "Applying xl170 paper hardware settings on node$i"
-        ssh "node$i" '
-            set -euo pipefail
-            iface="ens1f1"
-            if [[ ! -d /sys/class/net/$iface ]]; then
-                echo "Expected xl170 interface $iface not found on $(hostname)" >&2
-                exit 1
-            fi
-            sudo ip link set dev "$iface" mtu 3000
-            sudo ethtool -K "$iface" tso on gso on gro on >/dev/null 2>&1 || true
-            if command -v cpupower >/dev/null 2>&1; then
-                sudo cpupower frequency-set -g performance >/dev/null 2>&1 || true
-            fi
-            for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                [[ -e "$f" ]] || continue
-                printf "performance\n" | sudo tee "$f" >/dev/null || true
-            done
-            sudo sysctl -w net.core.rps_sock_flow_entries=32768 >/dev/null
-            sudo ethtool -C "$iface" adaptive-rx off rx-usecs 5 rx-frames 1 >/dev/null 2>&1 || true
-            for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
-                [[ -e "$f" ]] || continue
-                printf "2048\n" | sudo tee "$f" >/dev/null || true
-            done
-            for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
-                [[ -e "$f" ]] || continue
-                printf "fffff\n" | sudo tee "$f" >/dev/null || true
-            done
-            sudo ethtool -K "$iface" ntuple on >/dev/null 2>&1 || true
-        '
-    done
+getent hosts node-0 >/dev/null || {
+    echo "$node_name: node-0 is missing from host resolution" >&2
+    exit 1
 }
 
-verify_xl170_paper_hardware() {
-    for i in "${!HOSTS[@]}"; do
-        log "xl170-verify" "Verifying xl170 paper hardware settings on node$i"
-        ssh "node$i" '
-            set -euo pipefail
-            node_name="$(hostname)"
-            iface="ens1f1"
-            cpu_model="$(lscpu | awk -F: "/Model name:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            nic_driver="$(ethtool -i "$iface" 2>/dev/null | awk -F: "/driver:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            nic_speed="$(ethtool "$iface" 2>/dev/null | awk -F: "/Speed:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            if [[ "$cpu_model" != *"E5-2640 v4"* && "$cpu_model" != *"E5-2640v4"* ]]; then
-                echo "$node_name: unexpected CPU model: $cpu_model" >&2; exit 1
-            fi
-            if [[ "$nic_driver" != "mlx5_core" ]]; then
-                echo "$node_name: unexpected NIC driver: $nic_driver" >&2; exit 1
-            fi
-            if [[ "$nic_speed" != "25000Mb/s" ]]; then
-                echo "$node_name: unexpected NIC speed: $nic_speed" >&2; exit 1
-            fi
-            mtu="$(ip -o link show "$iface" | awk "{for (i=1;i<=NF;i++) if (\$i==\"mtu\") {print \$(i+1); exit}}")"
-            if [[ "$mtu" != "3000" ]]; then
-                echo "$node_name: MTU=$mtu, expected 3000" >&2; exit 1
-            fi
-            governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
-            if [[ "$governor" != "performance" ]]; then
-                echo "$node_name: CPU governor=$governor, expected performance" >&2; exit 1
-            fi
-            rps_sock="$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null || echo 0)"
-            if [[ "$rps_sock" != "32768" ]]; then
-                echo "$node_name: rps_sock_flow_entries=$rps_sock, expected 32768" >&2; exit 1
-            fi
-            adaptive_rx="$(ethtool -c "$iface" 2>/dev/null | awk -F: "/Adaptive RX:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            rx_usecs="$(ethtool -c "$iface" 2>/dev/null | awk -F: "/rx-usecs:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            rx_frames="$(ethtool -c "$iface" 2>/dev/null | awk -F: "/rx-frames:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            if [[ "$rx_usecs" != "5" || "$rx_frames" != "1" || "$adaptive_rx" != off* ]]; then
-                echo "$node_name: coalescing adaptive-rx=$adaptive_rx rx-usecs=$rx_usecs rx-frames=$rx_frames, expected off/5/1" >&2; exit 1
-            fi
-            ntuple="$(ethtool -k "$iface" 2>/dev/null | awk -F: "/ntuple-filters:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            if [[ "$ntuple" != "on" ]]; then
-                echo "$node_name: ntuple-filters=$ntuple, expected on" >&2; exit 1
-            fi
-            tso="$(ethtool -k "$iface" 2>/dev/null | awk -F: "/tcp-segmentation-offload:/ {gsub(/^ +/, \"\", \$2); print \$2; exit}")"
-            if [[ "$tso" != "on" ]]; then
-                echo "$node_name: tcp-segmentation-offload=$tso, expected on" >&2; exit 1
-            fi
-            for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
-                [[ -e "$f" ]] || continue
-                value="$(cat "$f")"
-                if [[ "$value" != "2048" ]]; then
-                    echo "$node_name: $f=$value, expected 2048" >&2; exit 1
-                fi
-            done
-            for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
-                [[ -e "$f" ]] || continue
-                value="$(cat "$f")"
-                if [[ "$value" != "fffff" ]]; then
-                    echo "$node_name: $f=$value, expected fffff" >&2; exit 1
-                fi
-            done
-            printf "%s: xl170 paper hardware settings OK\n" "$node_name"
-        '
-    done
+if [[ "$(sysctl -n net.ipv4.tcp_ecn)" != "1" ]]; then
+    echo "$node_name: tcp_ecn is not enabled" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" != "dctcp" ]]; then
+    echo "$node_name: tcp_congestion_control is not dctcp" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.ipv4.tcp_fastopen)" != "$tcp_fastopen" ]]; then
+    echo "$node_name: tcp_fastopen is not $tcp_fastopen" >&2
+    exit 1
+fi
+
+if [[ "$(sysctl -n net.homa.link_mbps)" != "$link_mbps" ]]; then
+    echo "$node_name: net.homa.link_mbps is not $link_mbps" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.homa.max_nic_queue_ns)" != "$max_nic_queue_ns" ]]; then
+    echo "$node_name: net.homa.max_nic_queue_ns is not $max_nic_queue_ns" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.homa.rtt_bytes)" != "$rtt_bytes" ]]; then
+    echo "$node_name: net.homa.rtt_bytes is not $rtt_bytes" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.homa.grant_increment)" != "$grant_increment" ]]; then
+    echo "$node_name: net.homa.grant_increment is not $grant_increment" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.homa.max_gso_size)" != "$max_gso_size" ]]; then
+    echo "$node_name: net.homa.max_gso_size is not $max_gso_size" >&2
+    exit 1
+fi
+if [[ "$(sysctl -n net.homa.num_priorities)" != "$num_priorities" ]]; then
+    echo "$node_name: net.homa.num_priorities is not $num_priorities" >&2
+    exit 1
+fi
+
+rps_sock="$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null || echo 0)"
+if [[ "$rps_sock" != "$rps_sock_flow_entries" ]]; then
+    echo "$node_name: rps_sock_flow_entries=$rps_sock, expected $rps_sock_flow_entries" >&2
+    exit 1
+fi
+
+rx_usecs="$(ethtool -c "$iface" 2>/dev/null | awk -F: '/rx-usecs:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+rx_frames="$(ethtool -c "$iface" 2>/dev/null | awk -F: '/rx-frames:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+tx_usecs="$(ethtool -c "$iface" 2>/dev/null | awk -F: '/tx-usecs:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+tx_frames="$(ethtool -c "$iface" 2>/dev/null | awk -F: '/tx-frames:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+adaptive_rx="$(ethtool -c "$iface" 2>/dev/null | awk -F: '/Adaptive RX:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+if [[ "$rx_usecs" != "0" || "$rx_frames" != "0" || "$tx_usecs" != "0" || "$tx_frames" != "0" || "$adaptive_rx" != off* ]]; then
+    echo "$node_name: coalescing is not fully disabled" >&2
+    exit 1
+fi
+
+tso="$(ethtool -k "$iface" 2>/dev/null | awk -F: '/tcp-segmentation-offload:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+if [[ "$tso" != "on" ]]; then
+    echo "$node_name: tcp-segmentation-offload=$tso, expected on" >&2
+    exit 1
+fi
+
+ntuple="$(ethtool -k "$iface" 2>/dev/null | awk -F: '/ntuple-filters:/ {gsub(/^ +/, "", $2); print $2; exit}')"
+if [[ "$ntuple" != "on" ]]; then
+    echo "$node_name: ntuple-filters=$ntuple, expected on" >&2
+    exit 1
+fi
+
+for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+    [[ -e "$f" ]] || continue
+    value="$(cat "$f")"
+    if [[ "$value" != "$rps_flow_cnt" ]]; then
+        echo "$node_name: $f=$value, expected $rps_flow_cnt" >&2
+        exit 1
+    fi
+done
+
+for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+    [[ -e "$f" ]] || continue
+    value="$(cat "$f")"
+    if [[ "$value" != "$rps_cpus_mask" ]]; then
+        echo "$node_name: $f=$value, expected $rps_cpus_mask" >&2
+        exit 1
+    fi
+done
+
+governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+if [[ -n "$governor" && "$governor" != "performance" ]]; then
+    echo "$node_name: CPU governor is '$governor', expected 'performance'" >&2
+    exit 1
+fi
+
+echo "$node_name: OK"
+INNER
+done
+EOF
+}
+
+generate_switch_config_hint() {
+    mkdir -p "$(dirname "$SWITCH_CONFIG_OUT")"
+    python3 "$REPO_ROOT/cloudlab/config_switch" >"$SWITCH_CONFIG_OUT"
+    log switch "Generated switch config commands at $SWITCH_CONFIG_OUT"
+}
+
+print_post_setup_notes() {
+    cat <<EOF
+
+Setup complete.
+
+Paper-aligned settings applied:
+- node0 fanout SSH using private aliases node-0..node-9
+- /etc/hosts entries for node-<id> on every node
+- Homa module loaded with 25 Gbps / paper-style sysctls
+- MTU $MGMT_MTU on $MGMT_IFACE
+- MTU $PAPER_MTU on $PRIVATE_IFACE
+- RPS/RFS enabled, ntuple on, TSO on, interrupt moderation disabled
+- DCTCP enabled with tcp_ecn=1 and tcp_congestion_control=dctcp
+
+Remaining manual paper prerequisites:
+- Apply the switch QoS/ECN configuration in $SWITCH_CONFIG_OUT
+- Confirm your CloudLab image/kernel matches the target environment
+- If you want the paper's exact mitigation state, verify Meltdown/PTI is disabled separately; this script only reports host tuning needed by the benchmark wrappers
+
+Recommended verification run:
+  PAPER_MODE=true PAPER_MTU=$PAPER_MTU START_SCRIPT=$START_SCRIPT experiments/run_cp_basic.sh
+EOF
 }
 
 main() {
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            -h|--help|help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    fi
+
     require_cmd ssh
-    require_cmd ssh-copy-id
     require_cmd ssh-keygen
     require_cmd awk
+    require_cmd rsync
+    require_cmd python3
 
     read_hosts
     ensure_local_key
     write_local_ssh_config
     install_local_key_on_nodes
     verify_local_connectivity
-    prepare_node0_ssh
-    install_node0_key_on_peers
-    verify_node0_connectivity
-    setup_homa_on_node0
-    verify_homa_on_node0
-    configure_dctcp
-    verify_dctcp
-    configure_xl170_paper_hardware
-    verify_xl170_paper_hardware
 
-    log "done" "10-node SSH bootstrap complete, Homa utilities are built on node0, DCTCP and xl170 paper hardware settings are configured"
+    prepare_node0
+    authorize_node0_key_on_peers
+    bootstrap_private_aliases_on_node0
+    distribute_runtime_and_configure_nodes
+    verify_node0_private_connectivity
+    verify_cluster_setup
+    generate_switch_config_hint
+    print_post_setup_notes
 }
 
 main "$@"
