@@ -43,8 +43,7 @@ def make_variants(offsets_us):
 def apply_variant_options(options, variant):
     configured = copy.deepcopy(options)
     for key, value in variant.items():
-        if key in ("name", "label", "color99", "color50",
-                "netem_loss_percent", "netem_ecn"):
+        if key in ("name", "label", "color99", "color50"):
             continue
         setattr(configured, key, value)
     return configured
@@ -65,10 +64,6 @@ def configure_variant_environment(options, variant, all_nodes):
     set_sysctl_parameter("net.ipv4.tcp_fastopen",
             "3" if getattr(options, "tcp_fastopen", False) else "0",
             all_nodes)
-    configure_tcp_netem(all_nodes,
-            loss_percent=variant.get("netem_loss_percent",
-            options.tcp_loss_percent),
-            ecn=variant.get("netem_ecn", False))
 
 def plot_ready(experiment):
     try:
@@ -133,7 +128,6 @@ if not options.plot_only:
         options.gbps = bw * bw_multiplier
         unloaded_exp = "unloaded_" + workload
         try:
-            reset_tcp_netem(range(0, options.num_nodes))
             options.protocol = "homa"
             start_servers(range(1, 2), options)
 
@@ -167,7 +161,6 @@ if not options.plot_only:
                 checkpoint("variant saved %s_%s" % (variant["name"], workload))
                 if variant != VARIANTS[-1]:
                     time.sleep(options.variant_cooldown)
-            reset_tcp_netem(range(0, options.num_nodes))
         except Exception:
             if benchmark_error is None:
                 benchmark_error = sys.exc_info()
@@ -180,7 +173,6 @@ if not options.plot_only:
                 range(0, options.num_nodes))
         set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
                 range(0, options.num_nodes))
-        reset_tcp_netem(range(0, options.num_nodes))
         log("Stopping nodes")
         stop_nodes()
         scan_logs()

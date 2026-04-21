@@ -131,7 +131,7 @@ default_defaults = {
     # Note: very large numbers for client_max hurt Homa throughput with
     # unlimited load (throttle queue inserts take a long time).
     'client_max':          200,
-    'client_ports':        4,
+    'client_ports':        3,
     'log_dir':             'logs/' + time.strftime('%Y%m%d%H%M%S'),
     'mtu':                 0,
     'no_trunc':            '',
@@ -141,15 +141,16 @@ default_defaults = {
     'seconds':             5,
     'samples':             5,
     'sample_cooldown':     5,
-    'server_ports':        4,
+    'server_ports':        3,
     'tcp_client_ports':    4,
     'tcp_fastopen':        False,
     'tcp_http2':           False,
-    'tcp_client_pooling':  True,
-    'tcp_loss_percent':    0.0,
+    'tcp_http2_sessions':  1,
+    'tcp_client_pooling':  False,
+    'tcp_pool_size':       1,
     'tcp_load_aware':      False,
     'tcp_port_receivers':  1,
-    'tcp_server_ports':    4,
+    'tcp_server_ports':    8,
     'tcp_stagger_us':      0,
     'tcp_port_threads':    1,
     'unloaded':            0,
@@ -369,16 +370,21 @@ def get_parser(description, usage, defaults = {}):
             help='Approximate an HTTP/2-style single multiplexed TCP session '
             'per server by reusing one shared connection per client port '
             '(default: false)')
+    parser.add_argument('--tcp-http2-sessions', type=int,
+            dest='tcp_http2_sessions', metavar='count',
+            default=defaults['tcp_http2_sessions'],
+            help='Approximate HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS by '
+            'limiting concurrent logical streams per shared TCP session '
+            '(default: %d)'
+            % (defaults['tcp_http2_sessions']))
     parser.add_argument('--tcp-client-pooling', dest='tcp_client_pooling',
             type=boolean, default=defaults['tcp_client_pooling'],
             help='Reuse established TCP client connections across RPCs '
             '(default: true)')
-    parser.add_argument('--tcp-loss-percent', type=float,
-            dest='tcp_loss_percent', metavar='percent',
-            default=defaults['tcp_loss_percent'],
-            help='Artificial packet loss percentage to apply on the '
-            'cluster-facing interface during TCP-family experiments '
-            '(default: %.3f)' % (defaults['tcp_loss_percent']))
+    parser.add_argument('--tcp-pool-size', type=int, dest='tcp_pool_size',
+            metavar='count', default=defaults['tcp_pool_size'],
+            help='Number of pooled TCP connections to keep per server for '
+            'each TCP client port (default: %d)' % (defaults['tcp_pool_size']))
     parser.add_argument('--tcp-load-aware', dest='tcp_load_aware',
             type=boolean, default=defaults['tcp_load_aware'],
             help='Choose the least-backed-up TCP session for each new RPC '
@@ -390,8 +396,8 @@ def get_parser(description, usage, defaults = {}):
             'port (default: %d)'% (defaults['tcp_port_receivers']))
     parser.add_argument('--tcp-stagger-us', type=int, dest='tcp_stagger_us',
             metavar='usec', default=defaults['tcp_stagger_us'],
-            help='Delay the initial TCP client start for each node/port by a '
-            'multiple of this many microseconds (default: %d)'
+            help='Enable a persistent static scheduler with this '
+            'microsecond quantum for each TCP client lane (default: %d)'
             % (defaults['tcp_stagger_us']))
     parser.add_argument('--tcp-port-threads', type=int, dest='tcp_port_threads',
             metavar='count', default=defaults['tcp_port_threads'],
@@ -838,37 +844,6 @@ def write_tcp_counter_reports(name, deltas, qdisc_stats):
         with open(qdisc_path, "w") as f:
             f.write(qdisc_stats[id])
 
-def reset_tcp_netem(nodes):
-    """
-    Remove any root netem qdisc from the default cluster-facing interface
-    on the specified nodes.
-    """
-    script = (CLUSTER_IFACE_SCRIPT +
-        "if [[ -n \\\"$iface\\\" ]]; then "
-        "sudo tc qdisc del dev \\\"$iface\\\" root >/dev/null 2>&1 || true; "
-        "fi")
-    do_ssh(["bash", "-lc", script], nodes)
-
-def configure_tcp_netem(nodes, loss_percent=0.0, ecn=False):
-    """
-    Configure a root netem qdisc for the default cluster-facing interface on
-    the specified nodes. The qdisc is replaced if it already exists.
-    """
-    reset_tcp_netem(nodes)
-    if (loss_percent <= 0.0) and (not ecn):
-        return
-    command = "sudo tc qdisc replace dev \"$iface\" root netem"
-    if loss_percent > 0.0:
-        command += " loss %.3f%%" % (loss_percent)
-    if ecn:
-        command += " ecn"
-    script = (CLUSTER_IFACE_SCRIPT +
-        "if [[ -z \\\"$iface\\\" ]]; then "
-        "echo missing cluster interface >&2; exit 1; "
-        "fi; "
-        "%s" % (command))
-    do_ssh(["bash", "-lc", script], nodes)
-
 def get_sysctl_parameter(name):
     """
     Retrieve the value of a particular system parameter using sysctl on
@@ -966,7 +941,8 @@ def run_experiment(name, clients, options):
     first_server = server_nodes.start
     if "first_server" in options:
         first_server = options.first_server
-    for id in clients:
+    client_count = len(clients)
+    for client_rank, id in enumerate(clients):
         if options.protocol == "homa":
             command = "client --ports %d --port-receivers %d --server-ports %d " \
                     "--workload %s --server-nodes %d --first-server %d " \
@@ -990,6 +966,7 @@ def run_experiment(name, clients, options):
                 trunc = ''
             command = "client --ports %d --port-receivers %d --server-ports %d " \
                     "--workload %s --server-nodes %d --first-server %d " \
+                    "--client-nodes %d --client-rank %d " \
                     "--gbps %.3f %s --client-max %d --protocol %s --id %d" % (
                     options.tcp_client_ports,
                     options.tcp_port_receivers,
@@ -997,6 +974,8 @@ def run_experiment(name, clients, options):
                     options.workload,
                     num_servers,
                     first_server,
+                    client_count,
+                    client_rank,
                     options.gbps,
                     trunc,
                     options.client_max,
@@ -1004,10 +983,22 @@ def run_experiment(name, clients, options):
                     id);
             if getattr(options, "tcp_fastopen", False):
                 command += " --tcp-fastopen"
+            if getattr(options, "tcp_http2", False):
+                command += " --tcp-http2"
+                sessions = getattr(options, "tcp_http2_sessions", 1)
+                if sessions > 1:
+                    command += " --tcp-http2-sessions %d" % (sessions)
+            if getattr(options, "tcp_client_pooling", False) and \
+                    not getattr(options, "tcp_http2", False):
+                command += " --tcp-client-pooling"
             if getattr(options, "tcp_load_aware", False):
                 command += " --tcp-load-aware"
-            if not getattr(options, "tcp_client_pooling", True):
+            if (not getattr(options, "tcp_client_pooling", True)
+                    and not getattr(options, "tcp_http2", False)):
                 command += " --tcp-no-pooling"
+            pool_size = getattr(options, "tcp_pool_size", 1)
+            if pool_size > 1:
+                command += " --tcp-pool-size %d" % (pool_size)
             stagger_us = getattr(options, "tcp_stagger_us", 0)
             if stagger_us > 0:
                 command += " --tcp-stagger-us %d" % (stagger_us)

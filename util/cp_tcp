@@ -47,12 +47,23 @@ else:
 # First, run all of the experiments
 if not options.plot_only:
     congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
+    tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
+    tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
     if options.dctcp:
         set_sysctl_parameter("net.ipv4.tcp_congestion_control",
                         "dctcp", range(0, options.num_nodes))
+        set_sysctl_parameter("net.ipv4.tcp_ecn", "1", range(0, options.num_nodes))
     else:
         set_sysctl_parameter("net.ipv4.tcp_congestion_control",
                     "cubic", range(0, options.num_nodes))
+        set_sysctl_parameter("net.ipv4.tcp_ecn", "0", range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", "0",
+            range(0, options.num_nodes))
+    options.tcp_fastopen = False
+    options.tcp_http2 = False
+    options.tcp_http2_sessions = 1
+    options.tcp_client_pooling = False
+    options.tcp_pool_size = 1
     for workload, bw in load_info:
         options.workload = workload
         options.gbps = bw/2.0
@@ -76,6 +87,10 @@ if not options.plot_only:
             log(traceback.format_exc())
 
     set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
             range(0, options.num_nodes))
     log("Stopping nodes")
     stop_nodes()

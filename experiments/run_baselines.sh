@@ -8,6 +8,10 @@ NODE0_ALIAS="${NODE0_ALIAS:-node0}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
+BENCH_LABEL="${BENCH_LABEL:-Baselines}"
+LOG_PREFIX="${LOG_PREFIX:-baselines}"
+RESULTS_SUBDIR="${RESULTS_SUBDIR:-baseline}"
+SUMMARY_TITLE="${SUMMARY_TITLE:-Baselines Summary}"
 NUM_NODES="${NUM_NODES:-5}"
 RUN_SECONDS="${RUN_SECONDS:-5}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
@@ -17,14 +21,18 @@ HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
 HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
 HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
 CLIENT_MAX="${CLIENT_MAX:-200}"
-CLIENT_PORTS="${CLIENT_PORTS:-4}"
+CLIENT_PORTS="${CLIENT_PORTS:-3}"
 PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
 PORT_THREADS="${PORT_THREADS:-3}"
-SERVER_PORTS="${SERVER_PORTS:-4}"
+SERVER_PORTS="${SERVER_PORTS:-3}"
 TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
 TCP_CLIENT_POOLING="${TCP_CLIENT_POOLING:-false}"
+TCP_FASTOPEN="${TCP_FASTOPEN:-false}"
+TCP_HTTP2="${TCP_HTTP2:-false}"
+TCP_HTTP2_SESSIONS="${TCP_HTTP2_SESSIONS:-1}"
+TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
-TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-4}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
 UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
@@ -37,7 +45,6 @@ GBPS="${GBPS:-20}"
 TCP="false"
 DCTCP="true"
 SERVER_COUNT="${SERVER_COUNT:-1}"
-TCP_LOSS_PERCENT="${TCP_LOSS_PERCENT:-0.200}"
 LOCAL_LOG_DIR=""
 SUMMARY_MD=""
 
@@ -57,6 +64,15 @@ Optional:
   --seconds-multiplier M  Scale the run duration by this factor (default: 1)
   --tcp BOOL            Run the regular TCP comparison too (default: false)
   --dctcp BOOL          Run the DCTCP comparison (default: true)
+  --tcp-fastopen BOOL   Enable TCP Fast Open for TCP/DCTCP runs
+                        (default: false)
+  --tcp-http2 BOOL      Enable HTTP/2-style multiplexing for TCP/DCTCP runs
+                        (default: false)
+  --tcp-http2-sessions N
+                        Number of HTTP/2-style sessions per server for each
+                        TCP client port (default: 1)
+  --tcp-pool-size N     Number of pooled TCP connections per server for each
+                        TCP client port (default: 1)
   --link-mbps M         Homa link rate to configure on each node (default: 25000)
   --log-root DIR        Parent directory for cp_vs_tcp logs (default: logs)
   --start-script NAME   Remote module start script, or 'generic'
@@ -69,7 +85,9 @@ Optional:
 Environment overrides:
   CLOUDLAB_USER, REMOTE_REPO_DIR, REMOTE_COMPAT_REPO_LINK,
   START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS,
-  TCP_LOSS_PERCENT, TCP_CLIENT_POOLING
+  TCP_CLIENT_POOLING, TCP_FASTOPEN, TCP_HTTP2,
+  TCP_HTTP2_SESSIONS, TCP_POOL_SIZE,
+  BENCH_LABEL, LOG_PREFIX, RESULTS_SUBDIR, SUMMARY_TITLE
 
 Notes:
   - Run ssh_setup/ssh_setup.sh first so node aliases and key-based SSH are configured.
@@ -113,7 +131,7 @@ generate_summary_if_possible() {
         python3 "$REPO_ROOT/experiments/generate_dctcp_tuning_summary.py" \
             "$LOCAL_RUN_DIR" \
             --output "$SUMMARY_MD" \
-            --title "Baselines Summary" || true
+            --title "$SUMMARY_TITLE" || true
     else
         log warn "Skipping summary generation because no result artifacts were fetched"
     fi
@@ -121,7 +139,7 @@ generate_summary_if_possible() {
 
 on_error() {
     local exit_code="$1"
-    log warn "Baselines run failed; fetching any partial results to $LOCAL_RUN_DIR"
+    log warn "$BENCH_LABEL run failed; fetching any partial results to $LOCAL_RUN_DIR"
     mkdir -p "$LOCAL_LOG_DIR"
     rsync -e "ssh -o StrictHostKeyChecking=no" -rt \
         "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/" \
@@ -185,6 +203,22 @@ while [[ $# -gt 0 ]]; do
             DCTCP="$2"
             shift 2
             ;;
+        --tcp-fastopen)
+            TCP_FASTOPEN="$2"
+            shift 2
+            ;;
+        --tcp-http2)
+            TCP_HTTP2="$2"
+            shift 2
+            ;;
+        --tcp-http2-sessions)
+            TCP_HTTP2_SESSIONS="$2"
+            shift 2
+            ;;
+        --tcp-pool-size)
+            TCP_POOL_SIZE="$2"
+            shift 2
+            ;;
         --link-mbps)
             LINK_MBPS="$2"
             shift 2
@@ -245,8 +279,8 @@ if (( SERVER_COUNT > 0 )); then
     TOPOLOGY_TAG="servers${SERVER_COUNT}"
 fi
 WORKLOAD_TAG="${WORKLOAD:-allworkloads}"
-LOG_DIR="$LOG_ROOT/baselines_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/baseline"
+LOG_DIR="$LOG_ROOT/${LOG_PREFIX}_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/$RESULTS_SUBDIR"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
 LOCAL_LOG_DIR="$LOCAL_RUN_DIR/logs"
 mkdir -p "$RESULTS_RUN_ROOT"
@@ -391,9 +425,10 @@ INNER
 done
 EOF
 
-log setup "Refreshing Homa runtime on node-0 through node-$((NUM_NODES-1)) before baselines"
+log setup "Refreshing Homa runtime on node-0 through node-$((NUM_NODES-1)) before $BENCH_LABEL"
 ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" \
-    "$HOMA_RTT_BYTES" "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
+    "$HOMA_RTT_BYTES" "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" \
+    "$TCP_FASTOPEN" "$DCTCP" <<'EOF'
 set -euo pipefail
 num_nodes="$1"
 link_mbps="$2"
@@ -401,6 +436,16 @@ max_nic_queue_ns="$3"
 rtt_bytes="$4"
 grant_increment="$5"
 max_gso_size="$6"
+tcp_fastopen="$7"
+dctcp="$8"
+tcp_fastopen_sysctl=0
+tcp_ecn_sysctl=0
+if [[ "$tcp_fastopen" == "true" ]]; then
+    tcp_fastopen_sysctl=3
+fi
+if [[ "$dctcp" == "true" ]]; then
+    tcp_ecn_sysctl=1
+fi
 for i in $(seq 0 $((num_nodes-1))); do
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
         ~/bin/homa.ko ~/bin/cp_node ~/bin/homa_prio ~/bin/*.py "node-$i:~/bin/"
@@ -420,7 +465,9 @@ for i in $(seq 0 $((num_nodes-1))); do
             net.homa.max_nic_queue_ns=$max_nic_queue_ns \
             net.homa.rtt_bytes=$rtt_bytes \
             net.homa.grant_increment=$grant_increment \
-            net.homa.max_gso_size=$max_gso_size >/dev/null
+            net.homa.max_gso_size=$max_gso_size \
+            net.ipv4.tcp_fastopen=$tcp_fastopen_sysctl \
+            net.ipv4.tcp_ecn=$tcp_ecn_sysctl >/dev/null
     "
 done
 EOF
@@ -458,12 +505,12 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --tcp-loss-percent $TCP_LOSS_PERCENT --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-fastopen $TCP_FASTOPEN --tcp-http2 $TCP_HTTP2 --tcp-http2-sessions $TCP_HTTP2_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
 if [[ -n "$WORKLOAD" ]]; then
     CP_VS_TCP_CMD+=" -w $WORKLOAD"
 fi
 
-log run "Launching cp_vs_tcp (baselines) on $NODE0_ALIAS with --servers $SERVER_COUNT"
+log run "Launching cp_vs_tcp ($BENCH_LABEL) on $NODE0_ALIAS with --servers $SERVER_COUNT"
 ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && $CP_VS_TCP_CMD'"
 
 log fetch "Copying results back to $LOCAL_RUN_DIR"
@@ -479,4 +526,4 @@ if [[ -f "$SUMMARY_MD" ]]; then
     sed -n '/^## /,$p' "$SUMMARY_MD"
 fi
 
-log done "Baselines benchmark complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RUN_DIR"
+log done "$BENCH_LABEL complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RUN_DIR"

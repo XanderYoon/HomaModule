@@ -72,6 +72,8 @@ if options.workload != "":
 # First, run all of the experiments
 if not options.plot_only:
     congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
+    tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
+    tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
     for workload, bw in load_info:
         options.workload = workload
         options.gbps = bw * bw_multiplier
@@ -98,19 +100,33 @@ if not options.plot_only:
 
             if options.tcp:
                 options.protocol = "tcp"
+                options.tcp_fastopen = False
+                options.tcp_http2 = False
+                options.tcp_http2_sessions = 1
+                options.tcp_client_pooling = False
+                options.tcp_pool_size = 1
                 set_sysctl_parameter("net.ipv4.tcp_congestion_control",
                         "cubic", range(0, options.num_nodes))
-                configure_tcp_netem(range(0, options.num_nodes),
-                        loss_percent=options.tcp_loss_percent)
+                set_sysctl_parameter("net.ipv4.tcp_ecn", "0",
+                        range(0, options.num_nodes))
+                set_sysctl_parameter("net.ipv4.tcp_fastopen", "0",
+                        range(0, options.num_nodes))
                 start_servers(servers, options)
                 run_experiment(tcp_exp, clients, options)
 
             if options.dctcp:
                 options.protocol = "tcp"
+                options.tcp_fastopen = False
+                options.tcp_http2 = False
+                options.tcp_http2_sessions = 1
+                options.tcp_client_pooling = False
+                options.tcp_pool_size = 1
                 set_sysctl_parameter("net.ipv4.tcp_congestion_control",
                         "dctcp", range(0, options.num_nodes))
-                configure_tcp_netem(range(0, options.num_nodes),
-                        loss_percent=options.tcp_loss_percent)
+                set_sysctl_parameter("net.ipv4.tcp_ecn", "1",
+                        range(0, options.num_nodes))
+                set_sysctl_parameter("net.ipv4.tcp_fastopen", "0",
+                        range(0, options.num_nodes))
                 start_servers(servers, options)
                 run_experiment(dctcp_exp, clients, options)
         except Exception as e:
@@ -120,7 +136,10 @@ if not options.plot_only:
         print("Resetting TCP congestion control to %s" % (congestion))
         set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
                 range(0, options.num_nodes))
-        reset_tcp_netem(range(0, options.num_nodes))
+        set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+                range(0, options.num_nodes))
+        set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
+                range(0, options.num_nodes))
     log("Stopping nodes")
     stop_nodes()
     scan_logs()

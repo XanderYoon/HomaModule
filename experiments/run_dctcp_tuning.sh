@@ -25,15 +25,16 @@ NUM_NODES="${NUM_NODES:-5}"
 RUN_SECONDS="${RUN_SECONDS:-5}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 CLIENT_MAX="${CLIENT_MAX:-200}"
-CLIENT_PORTS="${CLIENT_PORTS:-4}"
+CLIENT_PORTS="${CLIENT_PORTS:-3}"
 PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
 PORT_THREADS="${PORT_THREADS:-3}"
-SERVER_PORTS="${SERVER_PORTS:-4}"
+SERVER_PORTS="${SERVER_PORTS:-3}"
 TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
+TCP_HTTP2_SESSIONS="${TCP_HTTP2_SESSIONS:-1}"
+TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
-TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-4}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
-TCP_LOSS_PERCENT="${TCP_LOSS_PERCENT:-0.200}"
 SAMPLES="${SAMPLES:-1}"
 SAMPLE_COOLDOWN="${SAMPLE_COOLDOWN:-5}"
 VARIANT_COOLDOWN="${VARIANT_COOLDOWN:-5}"
@@ -70,11 +71,11 @@ Optional:
   --port-threads N      Homa server threads baseline parameter
   --server-ports N      Homa server ports baseline parameter
   --tcp-client-ports N  Baseline TCP client ports
+  --tcp-http2-sessions N  Baseline HTTP/2 session count
+  --tcp-pool-size N     Baseline TCP pooled connection count
   --tcp-port-receivers N  Baseline TCP receiver threads
   --tcp-server-ports N  Baseline TCP server ports
   --tcp-port-threads N  Baseline TCP server threads
-  --tcp-loss-percent F  Artificial TCP packet loss percentage
-                        applied to all tuning variants (default: 0.200)
   --samples N           Number of repeated samples per experiment
                         (default: 1)
   --sample-cooldown S   Seconds to wait between repeated samples
@@ -224,6 +225,14 @@ while [[ $# -gt 0 ]]; do
             TCP_CLIENT_PORTS="$2"
             shift 2
             ;;
+        --tcp-http2-sessions)
+            TCP_HTTP2_SESSIONS="$2"
+            shift 2
+            ;;
+        --tcp-pool-size)
+            TCP_POOL_SIZE="$2"
+            shift 2
+            ;;
         --tcp-port-receivers)
             TCP_PORT_RECEIVERS="$2"
             shift 2
@@ -234,10 +243,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tcp-port-threads)
             TCP_PORT_THREADS="$2"
-            shift 2
-            ;;
-        --tcp-loss-percent)
-            TCP_LOSS_PERCENT="$2"
             shift 2
             ;;
         --samples)
@@ -486,7 +491,7 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_CMD="./$BENCH_SCRIPT -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $EFFECTIVE_SECONDS --samples $SAMPLES --sample-cooldown $SAMPLE_COOLDOWN --variant-cooldown $VARIANT_COOLDOWN -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --tcp-loss-percent $TCP_LOSS_PERCENT --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_CMD="./$BENCH_SCRIPT -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $EFFECTIVE_SECONDS --samples $SAMPLES --sample-cooldown $SAMPLE_COOLDOWN --variant-cooldown $VARIANT_COOLDOWN -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-http2-sessions $TCP_HTTP2_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
 if [[ -n "$VARIANT_FLAG" ]]; then
     CP_CMD+=" $VARIANT_FLAG $VARIANT_VALUE"
 fi

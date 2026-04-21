@@ -69,6 +69,8 @@ elif options.config == 'sports':
 
 if not options.plot_only:
     congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
+    tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
+    tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
     try:
         # For each workload, run a set of experiments with different
         # configurations.
@@ -92,15 +94,28 @@ if not options.plot_only:
                 o.protocol = "tcp"
                 o.workload = workload
                 o.gbps = bw/2.0
+                o.tcp_fastopen = False
+                o.tcp_http2 = False
+                o.tcp_http2_sessions = 1
+                o.tcp_client_pooling = False
+                o.tcp_pool_size = 1
                 start_servers(servers, o)
                 if options.tcp:
                     set_sysctl_parameter("net.ipv4.tcp_congestion_control",
                             "cubic", range(0, options.num_nodes))
+                    set_sysctl_parameter("net.ipv4.tcp_ecn", "0",
+                            range(0, options.num_nodes))
+                    set_sysctl_parameter("net.ipv4.tcp_fastopen", "0",
+                            range(0, options.num_nodes))
                     run_experiment("tcp_%s_%s" % (spec['exp_name'], workload),
                             clients, o)
                 if options.dctcp:
                     set_sysctl_parameter("net.ipv4.tcp_congestion_control",
                             "dctcp", range(0, options.num_nodes))
+                    set_sysctl_parameter("net.ipv4.tcp_ecn", "1",
+                            range(0, options.num_nodes))
+                    set_sysctl_parameter("net.ipv4.tcp_fastopen", "0",
+                            range(0, options.num_nodes))
                     run_experiment("dctcp_%s_%s" % (spec['exp_name'], workload),
                             clients, o)
     except Exception as e:
@@ -108,6 +123,10 @@ if not options.plot_only:
 
     print("Resetting TCP congestion control to %s" % (congestion))
     set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
             range(0, options.num_nodes))
 
     log("Stopping nodes")

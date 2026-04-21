@@ -50,6 +50,11 @@ def dctcp_variant(name, label, **kwargs):
         "name": name,
         "label": label,
         "protocol": "dctcp",
+        "tcp_fastopen": False,
+        "tcp_http2": False,
+        "tcp_http2_sessions": 1,
+        "tcp_client_pooling": False,
+        "tcp_pool_size": 1,
     }
     variant.update(kwargs)
     return variant
@@ -70,12 +75,12 @@ def make_variants(options):
     for pool_size in options.pool_sizes:
         variants.append(dctcp_variant("dctcp_pool_p%d" % (pool_size),
                 "DCTCP + Pool %d" % (pool_size),
-                tcp_client_pooling=True, tcp_client_ports=pool_size))
+                tcp_client_pooling=True, tcp_pool_size=pool_size))
     for session_count in options.http2_session_counts:
         variants.append(dctcp_variant("dctcp_http2_s%d" % (session_count),
                 "DCTCP + HTTP/2 x%d" % (session_count),
                 tcp_client_pooling=True, tcp_http2=True,
-                tcp_client_ports=1, tcp_port_receivers=session_count))
+                tcp_http2_sessions=session_count))
     for offset_us in options.offsets_us:
         variants.append(dctcp_variant("dctcp_static_o%d" % (offset_us),
                 "DCTCP + Offset %dus" % (offset_us),
@@ -108,7 +113,6 @@ def configure_variant_environment(options, variant, all_nodes):
     set_sysctl_parameter("net.ipv4.tcp_fastopen",
             "3" if getattr(options, "tcp_fastopen", False) else "0",
             all_nodes)
-    configure_tcp_netem(all_nodes, loss_percent=options.tcp_loss_percent)
 
 
 def run_homa_suite(options):
@@ -259,7 +263,6 @@ if not options.plot_only:
             range(0, options.num_nodes))
     set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
             range(0, options.num_nodes))
-    reset_tcp_netem(range(0, options.num_nodes))
     log("Stopping nodes")
     stop_nodes()
 

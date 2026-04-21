@@ -49,6 +49,7 @@
 #include <optional>
 #include <random>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "dist.h"
@@ -65,13 +66,17 @@ uint32_t client_port_max = 1;
 int client_ports = 0;
 int first_port = 4000;
 int first_server = 1;
+int client_nodes = 1;
+int client_rank = 0;
 bool is_server = false;
 int id = -1;
 double net_gbps = 0.0;
 bool tcp_trunc = true;
 bool tcp_fastopen = false;
 bool tcp_http2 = false;
-bool tcp_client_pooling = true;
+int tcp_http2_sessions = 1;
+bool tcp_client_pooling = false;
+int tcp_pool_size = 1;
 bool tcp_load_aware = false;
 int tcp_stagger_us = 0;
 int port_receivers = 1;
@@ -86,6 +91,14 @@ const char *workload = "100";
 int unloaded = 0;
 bool client_iovec = false;
 bool server_iovec = false;
+
+static uint64_t get_time_usec()
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return static_cast<uint64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+}
 
 /** @rand_gen: random number generator. */
 std::mt19937 rand_gen(
@@ -271,6 +284,10 @@ void print_help(const char *name)
 		"                      (default: %d)\n"
 		"    --first-port      Lowest port number to use for each server (default: %d)\n"
 		"    --first-server    Id of first server node (default: %d, meaning node-%d)\n"
+		"    --client-nodes    Number of client nodes participating in the run\n"
+		"                      (default: %d)\n"
+		"    --client-rank     Rank of this node among active client nodes\n"
+		"                      (default: %d)\n"
 		"    --gbps            Target network utilization, including only message data,\n"
 		"                      Gbps; 0 means send continuously (default: %.1f)\n"
 		"    --id              Id of this node; a value of I >= 0 means requests will\n"
@@ -281,12 +298,19 @@ void print_help(const char *name)
 		"                      sending thread per port (default: %d)\n"
 		"    --port-receivers  Number of threads to listen for responses on each\n"
 		"                      port (default: %d)\n"
-		"    --protocol        Transport protocol to use: homa or tcp (default: %s)\n"
-		"    --tcp-http2       Approximate an HTTP/2-style multiplexed session by\n"
-		"                      reusing one shared TCP connection per server\n"
-		"    --tcp-load-aware  Prefer the least-backed-up TCP session for new RPCs\n"
-		"    --tcp-stagger-us  Delay each client start by a multiple of this many\n"
-		"                      microseconds based on node and port id\n"
+			"    --protocol        Transport protocol to use: homa or tcp (default: %s)\n"
+			"    --tcp-http2       Approximate an HTTP/2-style multiplexed session by\n"
+			"                      reusing shared TCP connections per server\n"
+			"    --tcp-http2-sessions Approximate SETTINGS_MAX_CONCURRENT_STREAMS\n"
+			"                      for each shared HTTP/2-style TCP session\n"
+			"                      (default: 1)\n"
+			"    --tcp-client-pooling Reuse established TCP client connections\n"
+			"                      across RPCs (default: false)\n"
+			"    --tcp-pool-size   Number of pooled TCP connections to keep per\n"
+			"                      server for each client port (default: 1)\n"
+			"    --tcp-load-aware  Prefer the least-backed-up TCP session for new RPCs\n"
+		"    --tcp-stagger-us  Enable a persistent static scheduler with this\n"
+		"                      microsecond time quantum per client-port lane\n"
 		"    --server-nodes    Number of nodes running server threads (default: %d)\n"
 		"    --server-ports    Number of server ports on each server node\n"
 		"                      (default: %d)\n"
@@ -319,7 +343,8 @@ void print_help(const char *name)
 		"                      print has been invoked\n"
 		"     kfreeze          Freeze the kernel's internal timetrace\n"
 		"     print file       Dump timetrace information to file\n",
-		client_max, first_port, first_server, first_server, net_gbps,
+		client_max, first_port, first_server, first_server, client_nodes,
+		client_rank, net_gbps,
 		client_ports, port_receivers, protocol,
 		server_nodes, server_ports, workload,
 		first_port, protocol, port_threads, server_ports);
@@ -470,6 +495,47 @@ struct message_header {
 };
 
 /**
+ * struct tcp_frame_header - Application-level framing for TCP messages.
+ * Each logical request/response is split into one or more frames so bytes
+ * from different streams can be interleaved on a single TCP connection.
+ */
+struct tcp_frame_header {
+	/** @stream_id: identifies the logical message this frame belongs to. */
+	uint32_t stream_id;
+
+	/** @message_length: total number of logical message bytes. */
+	uint32_t message_length;
+
+	/** @payload_length: number of logical message bytes carried here. */
+	uint32_t payload_length;
+};
+
+/** @TCP_FRAME_DATA: maximum logical payload bytes carried by one frame. */
+static constexpr int TCP_FRAME_DATA = 4096;
+
+struct tcp_outgoing_stream {
+	message_header header;
+	int bytes_sent;
+
+	explicit tcp_outgoing_stream(const message_header& header)
+		: header(header)
+		, bytes_sent(0)
+	{}
+};
+
+struct tcp_incoming_stream {
+	int message_length;
+	int bytes_received;
+	message_header header;
+
+	tcp_incoming_stream()
+		: message_length(0)
+		, bytes_received(0)
+		, header()
+	{}
+};
+
+/**
  * init_server_addrs() - Set up the server_addrs table (addresses of the
  * server/port combinations that clients will communicate with), based on
  * current configuration parameters. Any previous contents of the table
@@ -564,6 +630,7 @@ class tcp_connection {
 	bool send_message(message_header *header);
 	void set_epoll_events(int epoll_fd, uint32_t events);
 	bool xmit();
+	int active_streams;
 	
 	/** @fd: File descriptor to use for reading and writing data. */
 	int fd;
@@ -584,33 +651,45 @@ class tcp_connection {
 	 * @peer: Address of the machine on the other end of this connection.
 	 */
 	struct sockaddr_in peer;
-	
+
 	/**
-	 * @bytes_received: nonzero means we have read part of an incoming
-	 * request; the value indicates how many bytes have been received
-	 * so far.
+	 * @bytes_received: number of bytes received for the current message in
+	 * legacy non-multiplexed TCP mode.
 	 */
 	int bytes_received;
-	
-	/**
-	 * @header: will eventually hold the first bytes of an incoming
-	 * message. If @bytes_received is less than the size of this value,
-	 * then it has not yet been fully read.
-	 */
+
+	/** @header: partially received message header in legacy TCP mode. */
 	message_header header;
 	
-	/**
-	 * @outgoing: queue of headers for messages waiting to be
-	 * transmitted. The first entry may have been partially transmitted.
-	 */
-	std::deque<message_header> outgoing;
-	
-	/*
-	 * @bytes_sent: Nonzero means we have sent part of the first message
-	 * in outgoing; the value indicates how many bytes have been
-	 * successfully transmitted.
-	 */
+	/** @incoming_bytes: raw bytes read from the socket awaiting parsing. */
+	std::vector<char> incoming_bytes;
+
+	/** @incoming_streams: partially reassembled incoming logical messages. */
+	std::unordered_map<uint32_t, tcp_incoming_stream> incoming_streams;
+
+	/** @outgoing: logical messages queued for transmission. */
+	std::deque<tcp_outgoing_stream> outgoing;
+
+	/** @legacy_outgoing: queued messages in legacy non-multiplexed mode. */
+	std::deque<message_header> legacy_outgoing;
+
+	/** @bytes_sent: bytes sent for the first legacy queued message. */
 	int bytes_sent;
+
+	/** @next_outgoing: round-robin cursor for multiplexed transmit. */
+	size_t next_outgoing;
+
+	/** @current_frame: serialized frame currently being transmitted. */
+	std::vector<char> current_frame;
+
+	/** @current_frame_offset: bytes already sent from @current_frame. */
+	size_t current_frame_offset;
+
+	/** @current_frame_stream: queue index for the frame in flight. */
+	size_t current_frame_stream;
+
+	/** @current_frame_payload: logical payload bytes carried by frame. */
+	int current_frame_payload;
 	
 	/**
 	 * @epoll_events: OR-ed combination of epoll events such as EPOLLIN
@@ -635,15 +714,24 @@ class tcp_connection {
  */
 tcp_connection::tcp_connection(int fd, uint32_t epoll_id, int port,
 		struct sockaddr_in peer)
-	: fd(fd)
+	: active_streams(0)
+	, fd(fd)
 	, epoll_id(epoll_id)
         , port(port)
 	, peer(peer)
 	, bytes_received(0)
-        , header()
+	, header()
+	, incoming_bytes()
+	, incoming_streams()
         , outgoing()
-        , bytes_sent(0)
-        , epoll_events(0)
+	, legacy_outgoing()
+	, bytes_sent(0)
+	, next_outgoing(0)
+	, current_frame()
+	, current_frame_offset(0)
+	, current_frame_stream(0)
+	, current_frame_payload(0)
+	, epoll_events(0)
 {
 }
 
@@ -653,7 +741,7 @@ tcp_connection::tcp_connection(int fd, uint32_t epoll_id, int port,
  */
 inline size_t tcp_connection::pending()
 {
-	return outgoing.size();
+	return tcp_http2 ? outgoing.size() : legacy_outgoing.size();
 }
 
 /**
@@ -716,55 +804,93 @@ int tcp_connection::read(bool loop,
 			
 		}
 	
-		/*
-		 * Process incoming bytes (could contains parts of multiple
-		 * requests). The first 4 bytes of each request give its
-		 * length.
-		 */
-		next = buffer;
-		while (count > 0) {
-			/* First, fill in the message header with incoming data
-			 * (there's no guarantee that a single read will return
-			 * all of the bytes needed for these).
-			 */
-			int header_bytes = sizeof32(message_header)
-				- bytes_received;
-			if (header_bytes > 0) {
-				if (count < header_bytes)
-					header_bytes = count;
-				char *dst = reinterpret_cast<char *>(&header);
-				memcpy(dst + bytes_received, next, header_bytes);
-				bytes_received += header_bytes;
-				next += header_bytes;
-				count -= header_bytes;
-				if (bytes_received < sizeof32(message_header)) {
-					tt("Received %d header bytes; need %d "
-							"more for complete "
-							"header", count,
-							sizeof32(message_header)
-							- bytes_received);
+		if (!tcp_http2) {
+			next = buffer;
+			while (count > 0) {
+				int header_bytes = sizeof32(message_header)
+						- bytes_received;
+				if (header_bytes > 0) {
+					if (count < header_bytes)
+						header_bytes = count;
+					char *dst = reinterpret_cast<char *>(&header);
+					memcpy(dst + bytes_received, next, header_bytes);
+					bytes_received += header_bytes;
+					next += header_bytes;
+					count -= header_bytes;
+					if (bytes_received < sizeof32(message_header))
+						break;
+				}
+				int needed = header.length - bytes_received;
+				if (count < needed) {
+					bytes_received += count;
 					break;
 				}
+				count -= needed;
+				next += needed;
+				func(&header);
+				bytes_received = 0;
 			}
-
-			/* At this point we know the request length, so read until
-			 * we've got a full request.
-			 */
-			int needed = header.length - bytes_received;
-			if (count < needed) {
-				tt("Received %d bytes for cid 0x%08x, id %d; "
-						"need %d more for complete "
-						"message", count, header.cid,
-						header.msg_id, needed-count);
-				bytes_received += count;
-				break;
+		} else {
+			incoming_bytes.insert(incoming_bytes.end(), buffer,
+					buffer + count);
+			while (incoming_bytes.size() >= sizeof(tcp_frame_header)) {
+				tcp_frame_header frame;
+				memcpy(&frame, incoming_bytes.data(), sizeof(frame));
+				size_t frame_bytes = sizeof(frame)
+						+ static_cast<size_t>(frame.payload_length);
+				if (incoming_bytes.size() < frame_bytes)
+					break;
+				if ((frame.payload_length == 0)
+						|| (frame.message_length < sizeof32(message_header))
+						|| (frame.payload_length > frame.message_length)) {
+					snprintf(error_message, sizeof(error_message),
+							"Malformed TCP frame on port %d (fd %d) from %s",
+							port, fd, print_address(&peer));
+					return 1;
+				}
+				tcp_incoming_stream &stream = incoming_streams[frame.stream_id];
+				if (stream.bytes_received == 0) {
+					stream.message_length = frame.message_length;
+				} else if (stream.message_length
+						!= static_cast<int>(frame.message_length)) {
+					snprintf(error_message, sizeof(error_message),
+							"Inconsistent TCP frame lengths on port %d "
+							"(fd %d) from %s",
+							port, fd, print_address(&peer));
+					return 1;
+				}
+				if (stream.bytes_received
+						+ static_cast<int>(frame.payload_length)
+						> stream.message_length) {
+					snprintf(error_message, sizeof(error_message),
+							"Oversized TCP frame payload on port %d (fd %d) "
+							"from %s", port, fd, print_address(&peer));
+					return 1;
+				}
+				const char *payload = incoming_bytes.data() + sizeof(frame);
+				if (stream.bytes_received < sizeof32(message_header)) {
+					int copy = sizeof32(message_header)
+							- stream.bytes_received;
+					if (copy > static_cast<int>(frame.payload_length))
+						copy = frame.payload_length;
+					memcpy(reinterpret_cast<char *>(&stream.header)
+							+ stream.bytes_received, payload, copy);
+				}
+				stream.bytes_received += frame.payload_length;
+				if (stream.bytes_received == stream.message_length) {
+					if (stream.header.length != stream.message_length) {
+						snprintf(error_message, sizeof(error_message),
+								"TCP frame/header length mismatch on port %d "
+								"(fd %d) from %s",
+								port, fd, print_address(&peer));
+						return 1;
+					}
+					func(&stream.header);
+					incoming_streams.erase(frame.stream_id);
+				}
+				incoming_bytes.erase(incoming_bytes.begin(),
+						incoming_bytes.begin() + frame_bytes);
 			}
-
-			/* We now have a full message. */
-			count -= needed;
-			next += needed;
-			func(&header);
-			bytes_received = 0;
 		}
 		if (!loop)
 			return 0;
@@ -810,9 +936,13 @@ bool tcp_connection::send_message(message_header *header)
 {
 	if (header->length < sizeof32(*header))
 		header->length = sizeof32(*header);
+	if (!tcp_http2) {
+		legacy_outgoing.emplace_back(*header);
+		if (legacy_outgoing.size() > 1)
+			return false;
+		return xmit();
+	}
 	outgoing.emplace_back(*header);
-	if (outgoing.size() > 1)
-		return false;
 	return xmit();
 }
 
@@ -826,33 +956,94 @@ bool tcp_connection::send_message(message_header *header)
 bool tcp_connection::xmit()
 {
 	char buffer[100000];
-	struct message_header *header;
-	int start;
-	int send_length;
 	ssize_t result;
 	
 	while (true) {
-		if (outgoing.size() == 0)
-			return true;
-		header = &outgoing[0];
-		if (bytes_sent < sizeof32(*header)) {
-			*(reinterpret_cast<message_header *>(buffer))
-					= *header;
-			start = bytes_sent;
-		} else
-			start = 0;
-		send_length = header->length - bytes_sent;
-		if (send_length > (sizeof32(buffer) - start))
-			send_length = sizeof32(buffer) - start;
-		result = send(fd, buffer + start, send_length,
+		if (!tcp_http2) {
+			if (legacy_outgoing.size() == 0)
+				return true;
+			message_header *header = &legacy_outgoing[0];
+			int start;
+			int send_length;
+			if (bytes_sent < sizeof32(*header)) {
+				*(reinterpret_cast<message_header *>(buffer)) = *header;
+				start = bytes_sent;
+			} else {
+				start = 0;
+			}
+			send_length = header->length - bytes_sent;
+			if (send_length > (sizeof32(buffer) - start))
+				send_length = sizeof32(buffer) - start;
+			result = send(fd, buffer + start, send_length,
+					MSG_NOSIGNAL|MSG_DONTWAIT);
+			if (result >= 0)
+				bytes_sent += result;
+			else {
+				if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+					return false;
+				if ((errno == EPIPE) || (errno == ECONNRESET))
+					bytes_sent = header->length;
+				else {
+					log(NORMAL, "FATAL: error sending TCP message "
+							"to %s: %s (port %d)\n",
+							print_address(&peer),
+							strerror(errno), port);
+					exit(1);
+				}
+			}
+			if (bytes_sent < header->length)
+				continue;
+			bytes_sent = 0;
+			legacy_outgoing.pop_front();
+			continue;
+		}
+		if (current_frame.empty()) {
+			if (outgoing.empty())
+				return true;
+			if (next_outgoing >= outgoing.size())
+				next_outgoing = 0;
+			current_frame_stream = next_outgoing;
+			tcp_outgoing_stream &stream = outgoing[current_frame_stream];
+			int remaining = stream.header.length - stream.bytes_sent;
+			current_frame_payload = remaining;
+			if (current_frame_payload > TCP_FRAME_DATA)
+				current_frame_payload = TCP_FRAME_DATA;
+			tcp_frame_header frame = {
+				stream.header.msg_id,
+				static_cast<uint32_t>(stream.header.length),
+				static_cast<uint32_t>(current_frame_payload),
+			};
+			current_frame.resize(sizeof(frame)
+					+ static_cast<size_t>(current_frame_payload));
+			memcpy(current_frame.data(), &frame, sizeof(frame));
+			char *payload = current_frame.data() + sizeof(frame);
+			if (stream.bytes_sent < sizeof32(message_header)) {
+				int header_bytes = sizeof32(message_header)
+						- stream.bytes_sent;
+				if (header_bytes > current_frame_payload)
+					header_bytes = current_frame_payload;
+				memcpy(payload,
+						reinterpret_cast<char *>(&stream.header)
+						+ stream.bytes_sent, header_bytes);
+				if (header_bytes < current_frame_payload) {
+					memset(payload + header_bytes, 0,
+							current_frame_payload - header_bytes);
+				}
+			} else {
+				memset(payload, 0, current_frame_payload);
+			}
+			current_frame_offset = 0;
+		}
+		result = send(fd, current_frame.data() + current_frame_offset,
+				current_frame.size() - current_frame_offset,
 				MSG_NOSIGNAL|MSG_DONTWAIT);
 		if (result >= 0)
-			bytes_sent += result;
+			current_frame_offset += static_cast<size_t>(result);
 		else {
 			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
 				return false;
 			if ((errno == EPIPE) || (errno == ECONNRESET))
-				bytes_sent = header->length;
+				current_frame_offset = current_frame.size();
 			else {
 				log(NORMAL, "FATAL: error sending TCP message "
 						"to %s: %s (port %d)\n",
@@ -861,17 +1052,31 @@ bool tcp_connection::xmit()
 				exit(1);
 			}
 		}
-		if (bytes_sent < header->length) {
-			tt("Sent %d bytes (out of %d) on cid 0x%08x",
-					result, header->length, header->cid);
+		if (current_frame_offset < current_frame.size()) {
+			tt("Sent %d bytes of multiplexed TCP frame on fd %d",
+					static_cast<int>(result), fd);
 			continue;
 		}
-		bytes_sent = 0;
-		tt("Finished sending TCP message, cid 0x%08x, id %d, length %d, "
-				"%u messages queued", header->cid,
-				header->msg_id, header->length,
-				outgoing.size() - 1);
-		outgoing.pop_front();
+		tcp_outgoing_stream &stream = outgoing[current_frame_stream];
+		stream.bytes_sent += current_frame_payload;
+		tt("Finished sending TCP frame, cid 0x%08x, id %d, frame %d bytes, "
+				"%lu streams queued", stream.header.cid,
+				stream.header.msg_id, current_frame_payload,
+				outgoing.size());
+		current_frame.clear();
+		current_frame_offset = 0;
+		if (stream.bytes_sent >= stream.header.length) {
+			outgoing.erase(outgoing.begin() + current_frame_stream);
+			if (outgoing.empty()) {
+				next_outgoing = 0;
+			} else if (current_frame_stream >= outgoing.size()) {
+				next_outgoing = 0;
+			} else {
+				next_outgoing = current_frame_stream;
+			}
+		} else {
+			next_outgoing = (current_frame_stream + 1) % outgoing.size();
+		}
 	}
 }
 
@@ -1378,18 +1583,21 @@ class client {
 	 * struct rinfo - Holds information about a request that we will
 	 * want when we get the response.
 	 */
-	struct rinfo {
-		/** @start_time: rdtsc time when the request was sent. */
-		uint64_t start_time;
+		struct rinfo {
+			/** @start_time: rdtsc time when the request was sent. */
+			uint64_t start_time;
 
 		/**
 		 * @active: true means the request has been sent but
 		 * a response hasn't yet been received.
 		 */
-		bool active;
-		
-		rinfo() : start_time(0), active(false) {}
-	};
+			bool active;
+
+			/** @transport_slot: TCP connection slot used for this request. */
+			int transport_slot;
+			
+			rinfo() : start_time(0), active(false), transport_slot(-1) {}
+		};
 	    
 	client(int id);
 	virtual ~client();
@@ -1694,6 +1902,7 @@ void client::record(uint64_t end_time, message_header *header)
 	}
 	rtt = end_time - r->start_time;
 	r->active = false;
+	r->transport_slot = -1;
 	
 	int kcycles = rtt>>10;
 	tt("Received response, cid 0x%08x, id %u, length %d, "
@@ -2132,24 +2341,25 @@ void homa_client::measure_unloaded(int count)
  * responses. 
  */
 class tcp_client : public client {
-    public:
-	tcp_client(int id);
-	virtual ~tcp_client();
-	int connect_server(int server, bool add_epoll);
-	int choose_server();
-	void close_connection(size_t index);
-	void send_request(int server, message_header *header, int pid,
-			size_t *max_pending);
+	    public:
+		tcp_client(int id);
+		virtual ~tcp_client();
+		int connect_server(int server, int slot, bool add_epoll);
+		int choose_server();
+		int choose_pooled_slot(int server);
+		void close_connection(size_t index);
+		bool send_request(int server, message_header *header, int pid,
+				size_t *max_pending);
 	void unblock_connection(tcp_connection *connection);
 	void read(tcp_connection *connection, int pid);
 	void receiver(int id);
 	void sender(void);
 	
-	/** 
-	 * @connections: One entry for each server in server_addrs; used to
-	 * communicate with that server.
-	 */
-	std::vector<tcp_connection *> connections;
+		/**
+		 * @connections: One entry for each pooled connection slot across all
+		 * servers, along with any dynamically created non-pooled connections.
+		 */
+		std::vector<tcp_connection *> connections;
 	
 	/**
 	 * @blocked: Contains all of the connections for which there is
@@ -2166,8 +2376,11 @@ class tcp_client : public client {
 	 */
 	std::atomic<uint64_t> *bytes_rcvd;
 
-	/** @connection_server: maps each connection slot to its server index. */
-	std::vector<int> connection_server;
+		/** @connection_server: maps each connection slot to its server index. */
+		std::vector<int> connection_server;
+
+		/** @next_pooled_slot: round-robin index for each server's pool. */
+		std::vector<int> next_pooled_slot;
 	
 	/**
 	 * @backups: total number of times that a stream was congested
@@ -2222,6 +2435,7 @@ tcp_client::tcp_client(int id)
         , bytes_sent()
         , bytes_rcvd(NULL)
         , connection_server()
+        , next_pooled_slot()
         , backups(0)
         , epoll_fd(-1)
 	, epollet((port_receivers > 1) ? EPOLLET : 0)
@@ -2242,10 +2456,15 @@ tcp_client::tcp_client(int id)
 	}
 	
 	for (uint32_t i = 0; i < server_addrs.size(); i++) {
-		connections.emplace_back(nullptr);
-		connection_server.push_back(i);
-		if (tcp_client_pooling && !tcp_fastopen)
-			connect_server(i, true);
+		next_pooled_slot.push_back(0);
+		int pool_slots = tcp_client_pooling ? tcp_pool_size : 1;
+		for (int pool_index = 0; pool_index < pool_slots; pool_index++) {
+			int slot = connections.size();
+			connections.emplace_back(nullptr);
+			connection_server.push_back(i);
+			if (tcp_client_pooling && !tcp_fastopen)
+				connect_server(i, slot, true);
+		}
 	}
 	
 	for (int i = 0; i < port_receivers; i++) {
@@ -2305,7 +2524,7 @@ tcp_client::~tcp_client()
 	delete[] bytes_rcvd;
 }
 
-int tcp_client::connect_server(int server, bool add_epoll)
+int tcp_client::connect_server(int server, int slot, bool add_epoll)
 {
 	int fd = socket(PF_INET, SOCK_STREAM, 0);
 	if (fd == -1) {
@@ -2345,9 +2564,7 @@ int tcp_client::connect_server(int server, bool add_epoll)
 				strerror(errno));
 		exit(1);
 	}
-	int slot;
 	if (tcp_client_pooling) {
-		slot = server;
 		if (connections[slot] != NULL)
 			close_connection(slot);
 	} else {
@@ -2372,6 +2589,34 @@ int tcp_client::connect_server(int server, bool add_epoll)
 	return slot;
 }
 
+int tcp_client::choose_pooled_slot(int server)
+{
+	int slots_per_server = tcp_pool_size;
+	int start = server*slots_per_server;
+	if (slots_per_server <= 1)
+		return start;
+	if (tcp_load_aware) {
+		size_t best_pending = ~0ull;
+		int best_slot = start;
+		for (int offset = 0; offset < slots_per_server; offset++) {
+			int slot = start + offset;
+			tcp_connection *connection = connections[slot];
+			if (connection == NULL)
+				return slot;
+			size_t pending = connection->pending();
+			if (pending < best_pending) {
+				best_pending = pending;
+				best_slot = slot;
+			}
+		}
+		return best_slot;
+	}
+	int slot = start + next_pooled_slot[server];
+	next_pooled_slot[server] = (next_pooled_slot[server] + 1)
+			% tcp_pool_size;
+	return slot;
+}
+
 void tcp_client::close_connection(size_t index)
 {
 	tcp_connection *connection = connections[index];
@@ -2391,16 +2636,26 @@ void tcp_client::unblock_connection(tcp_connection *connection)
 			blocked.end());
 }
 
-void tcp_client::send_request(int server, message_header *header, int pid,
+bool tcp_client::send_request(int server, message_header *header, int pid,
 		size_t *max_pending)
 {
 	std::lock_guard<std::recursive_mutex> lock(connection_mutex);
-	int slot = server;
-	if (tcp_client_pooling && (connections[server] == NULL))
-		connect_server(server, true);
-	if (!tcp_client_pooling)
-		slot = connect_server(server, false);
+	int slot;
+	if (tcp_client_pooling) {
+		slot = choose_pooled_slot(server);
+		if (connections[slot] == NULL)
+			connect_server(server, slot, true);
+		if (tcp_http2
+				&& (connections[slot]->active_streams >= tcp_http2_sessions)) {
+			return false;
+		}
+	} else {
+		slot = connect_server(server, -1, false);
+	}
 	tcp_connection *connection = connections[slot];
+	rinfos[header->msg_id].transport_slot = slot;
+	if (tcp_http2)
+		connection->active_streams++;
 	size_t old_pending = connection->pending();
 	tt("Sending TCP request, cid 0x%08x, id %u, length %d, pid %d",
 			header->cid, header->msg_id, header->length, pid);
@@ -2416,6 +2671,7 @@ void tcp_client::send_request(int server, message_header *header, int pid,
 		connection->set_epoll_events(epoll_fd, EPOLLIN|EPOLLOUT|epollet);
 	else
 		connection->set_epoll_events(epoll_fd, EPOLLIN|epollet);
+	return true;
 }
 
 int tcp_client::choose_server()
@@ -2450,6 +2706,10 @@ void tcp_client::sender()
 {
 	char thread_name[50];
 	int pid = syscall(__NR_gettid);
+	uint64_t cycles_per_us = get_cycles_per_sec()/1000000;
+	uint64_t scheduler_origin = 0;
+	uint64_t scheduler_slot = 0;
+	uint64_t scheduler_frame = 0;
 	
 	snprintf(thread_name, sizeof(thread_name), "C%d", id);
 	time_trace::thread_buffer thread_buffer(thread_name);
@@ -2458,11 +2718,30 @@ void tcp_client::sender()
 	message_header header;
 	size_t max_pending = 1;
 	if (tcp_stagger_us > 0) {
-		uint64_t cycles_per_us = get_cycles_per_sec()/1000000;
-		uint64_t stagger_units = static_cast<uint64_t>(::id)*client_ports + id;
-		next_start += stagger_units*static_cast<uint64_t>(tcp_stagger_us)
-				* cycles_per_us;
+		uint64_t lanes = static_cast<uint64_t>(client_nodes) * client_ports;
+		uint64_t lane = static_cast<uint64_t>(client_rank) * client_ports + id;
+		uint64_t frame_us = lanes * static_cast<uint64_t>(tcp_stagger_us);
+		uint64_t slot_us = lane * static_cast<uint64_t>(tcp_stagger_us);
+		uint64_t now_us = get_time_usec();
+		uint64_t phase_us = now_us % frame_us;
+		uint64_t wait_us = (phase_us <= slot_us)
+				? (slot_us - phase_us)
+				: (frame_us - phase_us + slot_us);
+		scheduler_slot = slot_us * cycles_per_us;
+		scheduler_frame = frame_us * cycles_per_us;
+		next_start += wait_us * cycles_per_us;
+		scheduler_origin = next_start - scheduler_slot;
 	}
+	auto align_to_schedule = [&](uint64_t target) {
+		if (scheduler_frame == 0)
+			return target;
+		uint64_t first_slot = scheduler_origin + scheduler_slot;
+		if (target <= first_slot)
+			return first_slot;
+		uint64_t delta = target - first_slot;
+		uint64_t rounds = (delta + scheduler_frame - 1)/scheduler_frame;
+		return first_slot + rounds*scheduler_frame;
+	};
 	
 	/* Index of the next connection in blocked on which to try sending. */
 	size_t next_blocked = 0;
@@ -2507,15 +2786,20 @@ void tcp_client::sender()
 		server = choose_server();
 		
 		header.length = request_lengths[next_length];
-		if ((header.length > HOMA_MAX_MESSAGE_LENGTH) && tcp_trunc)
+		if ((header.length > HOMA_MAX_MESSAGE_LENGTH) && tcp_trunc) {
 			header.length = HOMA_MAX_MESSAGE_LENGTH;
+		}
 		header.cid = server_ids[server];
 		header.cid.client_port = id;
 		header.msg_id = slot;
 		header.freeze = freeze[header.cid.server];
-		send_request(server, &header, pid, &max_pending);
-		if (verbose)
-			log(NORMAL, "tcp_client %d.%d sent request to server %d, "
+		if (!send_request(server, &header, pid, &max_pending)) {
+				rinfos[slot].active = false;
+				rinfos[slot].transport_slot = -1;
+				continue;
+			}
+			if (verbose)
+				log(NORMAL, "tcp_client %d.%d sent request to server %d, "
 					"port %d, length %d\n",
 					header.cid.client,
 					header.cid.client_port,
@@ -2531,7 +2815,8 @@ void tcp_client::sender()
 		if (next_length >= request_lengths.size())
 			next_length = 0;
 		lag = now - next_start;
-		next_start += request_intervals[next_interval];
+		next_start = align_to_schedule(next_start
+				+ request_intervals[next_interval]);
 		next_interval++;
 		if (next_interval >= request_intervals.size())
 			next_interval = 0;
@@ -2612,8 +2897,17 @@ void tcp_client::read(tcp_connection *connection, int pid)
 	int error = connection->read(epollet, [this, pid, &got_response]
 			(message_header *header) {
 		got_response = true;
+		int transport_slot = -1;
+		if (header->msg_id < rinfos.size())
+			transport_slot = rinfos[header->msg_id].transport_slot;
 		uint64_t end_time = rdtsc();
 		record(end_time, header);
+		if (tcp_http2 && (transport_slot >= 0)
+				&& (static_cast<size_t>(transport_slot) < connections.size())
+				&& (connections[transport_slot] != NULL)
+				&& (connections[transport_slot]->active_streams > 0)) {
+			connections[transport_slot]->active_streams--;
+		}
 		tt("Response for cid 0x%08x received by pid %d", pid);
 		bytes_rcvd[first_id[header->cid.server]
 				+ header->cid.server_port] += header->length;
@@ -2787,6 +3081,8 @@ int client_cmd(std::vector<string> &words)
 {
 	client_iovec = false;
 	client_max = 1;
+	client_nodes = 1;
+	client_rank = 0;
 	client_ports = 1;
 	first_port = 4000;
 	first_server = 1;
@@ -2796,7 +3092,9 @@ int client_cmd(std::vector<string> &words)
 	server_nodes = 1;
 	tcp_fastopen = false;
 	tcp_http2 = false;
-	tcp_client_pooling = true;
+	tcp_http2_sessions = 1;
+	tcp_client_pooling = false;
+	tcp_pool_size = 1;
 	tcp_load_aware = false;
 	tcp_stagger_us = 0;
 	tcp_trunc = true;
@@ -2808,6 +3106,14 @@ int client_cmd(std::vector<string> &words)
 		if (strcmp(option, "--client-max") == 0) {
 			if (!parse(words, i+1, (int *) &client_max,
 					option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--client-nodes") == 0) {
+			if (!parse(words, i+1, &client_nodes, option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--client-rank") == 0) {
+			if (!parse(words, i+1, &client_rank, option, "integer"))
 				return 0;
 			i++;
 		} else if (strcmp(option, "--first-port") == 0) {
@@ -2830,11 +3136,21 @@ int client_cmd(std::vector<string> &words)
 			client_iovec = true;
 		} else if (strcmp(option, "--tcp-fastopen") == 0) {
 			tcp_fastopen = true;
-		} else if (strcmp(option, "--tcp-http2") == 0) {
-			tcp_http2 = true;
-			tcp_client_pooling = true;
-		} else if (strcmp(option, "--tcp-load-aware") == 0) {
-			tcp_load_aware = true;
+	} else if (strcmp(option, "--tcp-http2") == 0) {
+		tcp_http2 = true;
+		tcp_client_pooling = true;
+	} else if (strcmp(option, "--tcp-client-pooling") == 0) {
+		tcp_client_pooling = true;
+	} else if (strcmp(option, "--tcp-http2-sessions") == 0) {
+		if (!parse(words, i+1, &tcp_http2_sessions, option, "integer"))
+			return 0;
+		i++;
+	} else if (strcmp(option, "--tcp-pool-size") == 0) {
+		if (!parse(words, i+1, &tcp_pool_size, option, "integer"))
+			return 0;
+		i++;
+	} else if (strcmp(option, "--tcp-load-aware") == 0) {
+		tcp_load_aware = true;
 		} else if (strcmp(option, "--tcp-no-pooling") == 0) {
 			tcp_client_pooling = false;
 		} else if (strcmp(option, "--tcp-stagger-us") == 0) {
@@ -2886,6 +3202,22 @@ int client_cmd(std::vector<string> &words)
 			printf("Unknown option '%s'\n", option);
 			return 0;
 		}
+	}
+	if (tcp_http2_sessions < 1) {
+		printf("--tcp-http2-sessions must be at least 1\n");
+		return 0;
+	}
+	if (client_nodes < 1) {
+		printf("--client-nodes must be at least 1\n");
+		return 0;
+	}
+	if ((client_rank < 0) || (client_rank >= client_nodes)) {
+		printf("--client-rank must be in the range [0, client-nodes)\n");
+		return 0;
+	}
+	if (tcp_pool_size < 1) {
+		printf("--tcp-pool-size must be at least 1\n");
+		return 0;
 	}
 	init_server_addrs();
 	client_port_max = client_max/client_ports;

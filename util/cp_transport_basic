@@ -28,8 +28,7 @@ VARIANTS = [
         "tcp_fastopen": True,
         "tcp_client_pooling": True,
         "tcp_http2": True,
-        "tcp_client_ports": 1,
-        "tcp_port_receivers": 2,
+        "tcp_http2_sessions": 2,
     },
     {
         "name": "dctcp_tfo_staggered",
@@ -37,8 +36,6 @@ VARIANTS = [
         "tcp_fastopen": True,
         "tcp_client_pooling": True,
         "tcp_stagger_us": 25,
-        "netem_loss_percent": 0.200,
-        "netem_ecn": True,
     },
     {
         "name": "dctcp_tfo_load_aware",
@@ -73,7 +70,7 @@ def avg(values, fmt):
 def apply_variant_options(options, variant):
     configured = copy.deepcopy(options)
     for key, value in variant.items():
-        if key in ("name", "label", "netem_loss_percent", "netem_ecn"):
+        if key in ("name", "label"):
             continue
         setattr(configured, key, value)
     return configured
@@ -85,10 +82,6 @@ def configure_variant_environment(options, variant, all_nodes):
     set_sysctl_parameter("net.ipv4.tcp_fastopen",
             "3" if getattr(options, "tcp_fastopen", False) else "0",
             all_nodes)
-    configure_tcp_netem(all_nodes,
-            loss_percent=variant.get("netem_loss_percent",
-            options.tcp_loss_percent),
-            ecn=variant.get("netem_ecn", False))
 
 def run_homa_suite(options):
     start_servers(range(1, options.num_nodes), options)
@@ -203,7 +196,6 @@ if not options.plot_only:
     set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
             range(0, options.num_nodes))
     set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn, range(0, options.num_nodes))
-    reset_tcp_netem(range(0, options.num_nodes))
     log("Stopping nodes")
     stop_nodes()
 
