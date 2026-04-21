@@ -15,17 +15,22 @@ DEFAULTS_25G = {
 
 load_info = [["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
 
-def parse_session_count(value, option_name):
+def parse_session_counts(value, option_name):
     try:
-        session_count = int(value)
+        session_counts = [int(part.strip()) for part in value.split(",")
+                if part.strip()]
     except ValueError:
         raise Error("Illegal value for %s: %s" % (option_name, value))
-    if session_count <= 0:
-        raise Error("%s values must be positive: %s" % (option_name, value))
-    return session_count
+    if len(session_counts) == 0:
+        raise Error("%s must contain at least one positive integer"
+                % (option_name))
+    for session_count in session_counts:
+        if session_count <= 0:
+            raise Error("%s values must be positive: %s" % (option_name, value))
+    return session_counts
 
-def make_variants(session_count):
-    return [
+def make_variants(session_counts):
+    variants = [
         {
             "name": "dctcp",
             "label": "DCTCP",
@@ -37,18 +42,20 @@ def make_variants(session_count):
             "color99": dctcp_color,
             "color50": dctcp_color2,
         },
-        {
-            "name": "dctcp_multiplex",
+    ]
+    for index, session_count in enumerate(session_counts):
+        variants.append({
+            "name": "dctcp_multiplex_s%d" % (session_count),
             "label": "DCTCP + Multiplexing (%d)" % (session_count),
             "tcp_fastopen": False,
             "tcp_client_pooling": True,
             "tcp_multiplex": True,
             "tcp_multiplex_sessions": session_count,
             "tcp_pool_size": 1,
-            "color99": pyplot_colors[4],
-            "color50": pyplot_colors[6],
-        },
-    ]
+            "color99": pyplot_colors[(index * 2 + 4) % len(pyplot_colors)],
+            "color50": pyplot_colors[(index * 2 + 5) % len(pyplot_colors)],
+        })
+    return variants
 
 def apply_variant_options(options, variant):
     configured = copy.deepcopy(options)
@@ -86,13 +93,13 @@ parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
         "nodes will be clients. If 0, each node runs both a client and a "
         "server (default: 0)")
 parser.add_argument('--multiplex-sessions', dest='multiplex_sessions',
-        metavar='count', default="4",
-        help="Max concurrent logical streams per shared TCP session "
-        "(default: 4)")
+        metavar='counts', default="2,4,8",
+        help="Comma-separated max concurrent logical streams per shared TCP "
+        "session (default: 2,4,8)")
 options = parser.parse_args()
-session_count = parse_session_count(options.multiplex_sessions,
+session_counts = parse_session_counts(options.multiplex_sessions,
         "--multiplex-sessions")
-VARIANTS = make_variants(session_count)
+VARIANTS = make_variants(session_counts)
 init(options)
 if options.num_servers <= 0:
     servers = range(0, options.num_nodes)
@@ -126,6 +133,7 @@ if not options.plot_only:
         options.workload = workload
         options.gbps = bw * bw_multiplier
         unloaded_exp = "unloaded_" + workload
+        homa_exp = "homa_" + workload
         try:
             options.protocol = "homa"
             start_servers(range(1, 2), options)
@@ -140,14 +148,29 @@ if not options.plot_only:
             o.unloaded = 500
             run_experiment(unloaded_exp, range(0, 1), o)
 
+            start_servers(servers, options)
+            run_experiment(homa_exp, clients, options)
+
             for variant in VARIANTS:
                 tcp_options = apply_variant_options(options, variant)
                 tcp_options.protocol = "tcp"
                 configure_variant_environment(tcp_options,
                         range(0, options.num_nodes))
                 start_servers(servers, tcp_options)
-                run_experiment("%s_%s" % (variant["name"], workload),
-                        clients, tcp_options)
+                for sample in range(options.samples):
+                    log("Running %s sample %d/%d for %s" % (
+                            variant["name"], sample + 1, options.samples,
+                            workload))
+                    run_experiment("%s_%s" % (variant["name"], workload),
+                            clients, tcp_options)
+                    if sample != (options.samples - 1):
+                        checkpoint("sample saved %s_%s sample %d/%d"
+                                % (variant["name"], workload, sample + 1,
+                                options.samples))
+                        time.sleep(options.sample_cooldown)
+                checkpoint("variant saved %s_%s" % (variant["name"], workload))
+                if variant != VARIANTS[-1]:
+                    time.sleep(options.variant_cooldown)
         except Exception as e:
             log(traceback.format_exc())
 
@@ -163,6 +186,7 @@ if not options.plot_only:
 
 for workload, bw in load_info:
     unloaded_exp = "unloaded_" + workload
+    homa_exp = "homa_" + workload
     first_exp = "%s_%s" % (VARIANTS[0]["name"], workload)
     try:
         set_unloaded(unloaded_exp)
@@ -202,15 +226,14 @@ for workload, bw in load_info:
             "%s/reports/vs_multiplex_tuning_%s_p99.pdf" % (options.log_dir, workload))
 
     log("Generating short message CDF for %s" % (workload))
-    unloaded_x, unloaded_y = get_short_cdf(unloaded_exp)
+    homa_x, homa_y = get_short_cdf(homa_exp)
     start_cdf_plot(title, 10, 0.99e05, 1e-05, "RTT (usecs)",
             "Cumulative Fraction Short Messages")
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
         x, y = get_short_cdf(exp)
         plt.plot(x, y, label=variant["label"], color=variant["color99"])
-    plt.plot(unloaded_x, unloaded_y, label="Homa best case",
-            color=unloaded_color)
+    plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
     save_plot_with_side_legend(plt.gca(),
             "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload),
             legend_y=0.88)

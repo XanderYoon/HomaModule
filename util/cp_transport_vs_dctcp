@@ -249,7 +249,6 @@ for workload, bw in load_info:
             "%s/reports/vs_tcp_%s_p99.pdf" % (options.log_dir, workload))
 
     log("Generating short message CDF for %s" % (workload))
-    unloaded_x, unloaded_y = get_short_cdf(unloaded_exp)
     homa_x, homa_y = get_short_cdf(homa_exp)
     start_cdf_plot(title, 10, 0.99e05, 1e-05, "RTT (usecs)",
             "Cumulative Fraction Short Messages")
@@ -262,7 +261,6 @@ for workload, bw in load_info:
             continue
         plt.plot(x, y, label=variant["label"], color=variant["color99"])
     plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
-    plt.plot(unloaded_x, unloaded_y, label="Homa best case", color=unloaded_color)
     save_plot_with_side_legend(plt.gca(),
             "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload),
             legend_y=0.88)

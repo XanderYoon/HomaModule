@@ -37,7 +37,7 @@ TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
 TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
-SAMPLES="${SAMPLES:-1}"
+SAMPLES="${SAMPLES:-5}"
 SAMPLE_COOLDOWN="${SAMPLE_COOLDOWN:-5}"
 VARIANT_COOLDOWN="${VARIANT_COOLDOWN:-5}"
 UNSCHED="${UNSCHED:-0}"
@@ -79,7 +79,7 @@ Optional:
   --tcp-server-ports N  Baseline TCP server ports
   --tcp-port-threads N  Baseline TCP server threads
   --samples N           Number of repeated samples per experiment
-                        (default: 1)
+                        (default: 5)
   --sample-cooldown S   Seconds to wait between repeated samples
                         (default: 5)
   --variant-cooldown S  Seconds to wait between variants

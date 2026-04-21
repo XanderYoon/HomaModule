@@ -14,17 +14,21 @@ DEFAULTS_25G = {
 }
 
 load_info = [["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
-def parse_offset_us(value):
+def parse_offsets_us(value):
     try:
-        offset_us = int(value)
+        offsets_us = [int(part.strip()) for part in value.split(",")
+                if part.strip()]
     except ValueError:
-        raise Error("Illegal value for --offset-us: %s" % (value))
-    if offset_us < 0:
-        raise Error("--offset-us must be non-negative: %s" % (value))
-    return offset_us
+        raise Error("Illegal value for --offsets-us: %s" % (value))
+    if len(offsets_us) == 0:
+        raise Error("--offsets-us must contain at least one non-negative integer")
+    for offset_us in offsets_us:
+        if offset_us < 0:
+            raise Error("--offsets-us must be non-negative: %s" % (value))
+    return offsets_us
 
-def make_variants(offset_us):
-    return [
+def make_variants(offsets_us):
+    variants = [
         {
             "name": "dctcp",
             "label": "DCTCP",
@@ -38,8 +42,10 @@ def make_variants(offset_us):
             "color99": dctcp_color,
             "color50": dctcp_color2,
         },
-        {
-            "name": "dctcp_static",
+    ]
+    for index, offset_us in enumerate(offsets_us):
+        variants.append({
+            "name": "dctcp_static_o%d" % (offset_us),
             "label": "DCTCP + Static Scheduler (%d us)" % (offset_us),
             "tcp_fastopen": False,
             "tcp_client_pooling": False,
@@ -48,10 +54,10 @@ def make_variants(offset_us):
             "tcp_pool_size": 1,
             "tcp_load_aware": False,
             "tcp_stagger_us": offset_us,
-            "color99": pyplot_colors[4],
-            "color50": pyplot_colors[6],
-        },
-    ]
+            "color99": pyplot_colors[(index * 2 + 4) % len(pyplot_colors)],
+            "color50": pyplot_colors[(index * 2 + 5) % len(pyplot_colors)],
+        })
+    return variants
 
 def apply_variant_options(options, variant):
     configured = copy.deepcopy(options)
@@ -88,13 +94,13 @@ parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
         "and this value indicates the number of server nodes; all other "
         "nodes will be clients. If 0, each node runs both a client and a "
         "server (default: 0)")
-parser.add_argument('--offset-us', dest='offset_us', metavar='offset',
-        default="5",
-        help="Static scheduler offset in microseconds to compare "
-        "(default: 5)")
+parser.add_argument('--offsets-us', dest='offsets_us', metavar='offsets',
+        default="3,5,10",
+        help="Comma-separated static scheduler offsets in microseconds to "
+        "compare (default: 3,5,10)")
 options = parser.parse_args()
-offset_us = parse_offset_us(options.offset_us)
-VARIANTS = make_variants(offset_us)
+offsets_us = parse_offsets_us(options.offsets_us)
+VARIANTS = make_variants(offsets_us)
 init(options)
 if options.num_servers <= 0:
     servers = range(0, options.num_nodes)
@@ -127,6 +133,7 @@ if not options.plot_only:
         options.workload = workload
         options.gbps = bw * bw_multiplier
         unloaded_exp = "unloaded_" + workload
+        homa_exp = "homa_" + workload
         try:
             options.protocol = "homa"
             start_servers(range(1, 2), options)
@@ -141,13 +148,28 @@ if not options.plot_only:
             o.unloaded = 500
             run_experiment(unloaded_exp, range(0, 1), o)
 
+            start_servers(servers, options)
+            run_experiment(homa_exp, clients, options)
+
             for variant in VARIANTS:
                 tcp_options = apply_variant_options(options, variant)
                 tcp_options.protocol = "tcp"
                 configure_variant_environment(tcp_options, range(0, options.num_nodes))
                 start_servers(servers, tcp_options)
-                run_experiment("%s_%s" % (variant["name"], workload),
-                        clients, tcp_options)
+                for sample in range(options.samples):
+                    log("Running %s sample %d/%d for %s" % (
+                            variant["name"], sample + 1, options.samples,
+                            workload))
+                    run_experiment("%s_%s" % (variant["name"], workload),
+                            clients, tcp_options)
+                    if sample != (options.samples - 1):
+                        checkpoint("sample saved %s_%s sample %d/%d"
+                                % (variant["name"], workload, sample + 1,
+                                options.samples))
+                        time.sleep(options.sample_cooldown)
+                checkpoint("variant saved %s_%s" % (variant["name"], workload))
+                if variant != VARIANTS[-1]:
+                    time.sleep(options.variant_cooldown)
         except Exception as e:
             log(traceback.format_exc())
 
@@ -163,6 +185,7 @@ if not options.plot_only:
 
 for workload, bw in load_info:
     unloaded_exp = "unloaded_" + workload
+    homa_exp = "homa_" + workload
     first_exp = "%s_%s" % (VARIANTS[0]["name"], workload)
     try:
         set_unloaded(unloaded_exp)
@@ -205,15 +228,14 @@ for workload, bw in load_info:
             options.log_dir, workload))
 
     log("Generating short message CDF for %s" % (workload))
-    unloaded_x, unloaded_y = get_short_cdf(unloaded_exp)
+    homa_x, homa_y = get_short_cdf(homa_exp)
     start_cdf_plot(title, 10, 0.99e05, 1e-05, "RTT (usecs)",
             "Cumulative Fraction Short Messages")
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
         x, y = get_short_cdf(exp)
         plt.plot(x, y, label=variant["label"], color=variant["color99"])
-    plt.plot(unloaded_x, unloaded_y, label="Homa best case",
-            color=unloaded_color)
+    plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
     save_plot_with_side_legend(plt.gca(),
             "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload),
             legend_y=0.88)

@@ -109,6 +109,7 @@ if not options.plot_only:
         options.workload = workload
         options.gbps = bw * bw_multiplier
         unloaded_exp = "unloaded_" + workload
+        homa_exp = "homa_" + workload
         try:
             options.protocol = "homa"
             start_servers(range(1, 2), options)
@@ -123,14 +124,29 @@ if not options.plot_only:
             o.unloaded = 500
             run_experiment(unloaded_exp, range(0, 1), o)
 
+            start_servers(servers, options)
+            run_experiment(homa_exp, clients, options)
+
             for variant in VARIANTS:
                 tcp_options = apply_variant_options(options, variant)
                 tcp_options.protocol = "tcp"
                 configure_variant_environment(tcp_options,
                         range(0, options.num_nodes))
                 start_servers(servers, tcp_options)
-                run_experiment("%s_%s" % (variant["name"], workload),
-                        clients, tcp_options)
+                for sample in range(options.samples):
+                    log("Running %s sample %d/%d for %s" % (
+                            variant["name"], sample + 1, options.samples,
+                            workload))
+                    run_experiment("%s_%s" % (variant["name"], workload),
+                            clients, tcp_options)
+                    if sample != (options.samples - 1):
+                        checkpoint("sample saved %s_%s sample %d/%d"
+                                % (variant["name"], workload, sample + 1,
+                                options.samples))
+                        time.sleep(options.sample_cooldown)
+                checkpoint("variant saved %s_%s" % (variant["name"], workload))
+                if variant != VARIANTS[-1]:
+                    time.sleep(options.variant_cooldown)
         except Exception as e:
             log(traceback.format_exc())
 
@@ -146,6 +162,7 @@ if not options.plot_only:
 
 for workload, bw in load_info:
     unloaded_exp = "unloaded_" + workload
+    homa_exp = "homa_" + workload
     first_exp = "%s_%s" % (VARIANTS[0]["name"], workload)
 
     set_unloaded(unloaded_exp)
@@ -182,15 +199,14 @@ for workload, bw in load_info:
             "%s/reports/vs_tfo_tuning_%s_p99.pdf" % (options.log_dir, workload))
 
     log("Generating short message CDF for %s" % (workload))
-    unloaded_x, unloaded_y = get_short_cdf(unloaded_exp)
+    homa_x, homa_y = get_short_cdf(homa_exp)
     start_cdf_plot(title, 10, 0.99e05, 1e-05, "RTT (usecs)",
             "Cumulative Fraction Short Messages")
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
         x, y = get_short_cdf(exp)
         plt.plot(x, y, label=variant["label"], color=variant["color99"])
-    plt.plot(unloaded_x, unloaded_y, label="Homa best case",
-            color=unloaded_color)
+    plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
     save_plot_with_side_legend(plt.gca(),
             "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload),
             legend_y=0.88)
