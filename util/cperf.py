@@ -571,7 +571,7 @@ def start_nodes(r, options):
             continue
         vlog("Starting cp_node on node-%d" % (id))
         node = subprocess.Popen(["ssh"] + SSH_OPTIONS + ["node-%d" % (id),
-                "cp_node"], encoding="utf-8",
+                "/usr/bin/cp_node"], encoding="utf-8",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT)
         fl = fcntl.fcntl(node.stdin, fcntl.F_GETFL)
