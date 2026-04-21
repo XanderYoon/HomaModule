@@ -35,6 +35,10 @@ TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
 TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
+SAMPLES="${SAMPLES:-5}"
+SAMPLE_COOLDOWN="${SAMPLE_COOLDOWN:-5}"
+VARIANT_COOLDOWN="${VARIANT_COOLDOWN:-5}"
+DCTCP_NETEM_LOSS="${DCTCP_NETEM_LOSS:-}"
 UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
@@ -74,6 +78,14 @@ Optional:
                         TCP client port (default: 1)
   --tcp-pool-size N     Number of pooled TCP connections per server for each
                         TCP client port (default: 1)
+  --samples N           Number of repeated samples per experiment
+                        (default: 5)
+  --sample-cooldown S   Seconds to wait between repeated samples
+                        (default: 5)
+  --variant-cooldown S  Seconds to wait between variants
+                        (default: 5)
+  --dctcp-netem-loss X  Optional tc netem loss applied only during DCTCP
+                        runs, such as 0.1% or 1% (default: none)
   --link-mbps M         Homa link rate to configure on each node (default: 25000)
   --log-root DIR        Parent directory for cp_vs_tcp logs (default: logs)
   --start-script NAME   Remote module start script, or 'generic'
@@ -218,6 +230,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tcp-pool-size)
             TCP_POOL_SIZE="$2"
+            shift 2
+            ;;
+        --samples)
+            SAMPLES="$2"
+            shift 2
+            ;;
+        --sample-cooldown)
+            SAMPLE_COOLDOWN="$2"
+            shift 2
+            ;;
+        --variant-cooldown)
+            VARIANT_COOLDOWN="$2"
+            shift 2
+            ;;
+        --dctcp-netem-loss)
+            DCTCP_NETEM_LOSS="$2"
             shift 2
             ;;
         --link-mbps)
@@ -500,7 +528,10 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-fastopen $TCP_FASTOPEN --tcp-multiplex $TCP_MULTIPLEX --tcp-multiplex-sessions $TCP_MULTIPLEX_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS --samples $SAMPLES --sample-cooldown $SAMPLE_COOLDOWN --variant-cooldown $VARIANT_COOLDOWN -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-fastopen $TCP_FASTOPEN --tcp-multiplex $TCP_MULTIPLEX --tcp-multiplex-sessions $TCP_MULTIPLEX_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+if [[ -n "$DCTCP_NETEM_LOSS" ]]; then
+    CP_VS_TCP_CMD+=" --dctcp-netem-loss $DCTCP_NETEM_LOSS"
+fi
 if [[ -n "$WORKLOAD" ]]; then
     CP_VS_TCP_CMD+=" -w $WORKLOAD"
 fi

@@ -787,6 +787,33 @@ def collect_qdisc_stats(nodes):
         "sudo tc -s qdisc show dev \"$iface\"")
     return run_ssh_capture(["bash", "-lc", script], nodes)
 
+def set_netem_loss(nodes, loss):
+    """
+    Apply a root netem qdisc with packet loss on the cluster-facing interface
+    for each node in nodes.
+
+    loss: String accepted by `tc netem loss`, such as "0.1%" or "1%".
+    """
+    script = (CLUSTER_IFACE_SCRIPT +
+        "if [[ -z \\\"$iface\\\" ]]; then exit 0; fi; "
+        "sudo tc qdisc replace dev \"$iface\" root netem loss %s"
+        % (shlex.quote(str(loss))))
+    for id in nodes:
+        subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id,
+                "bash", "-lc", script], check=True)
+
+def clear_netem_loss(nodes):
+    """
+    Remove a root netem qdisc from the cluster-facing interface on each node
+    in nodes, if present.
+    """
+    script = (CLUSTER_IFACE_SCRIPT +
+        "if [[ -z \\\"$iface\\\" ]]; then exit 0; fi; "
+        "sudo tc qdisc del dev \"$iface\" root >/dev/null 2>&1 || true")
+    for id in nodes:
+        subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id,
+                "bash", "-lc", script], check=True)
+
 def write_tcp_counter_reports(name, deltas, qdisc_stats):
     """
     Write per-node and aggregate TCP counter reports for an experiment.
