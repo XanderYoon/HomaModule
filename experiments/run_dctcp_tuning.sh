@@ -25,6 +25,8 @@ NUM_NODES="${NUM_NODES:-5}"
 RUN_SECONDS="${RUN_SECONDS:-5}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 CLIENT_MAX="${CLIENT_MAX:-200}"
+# 25G benchmark defaults. These values should match the benchmark-side
+# defaults used by the load-aware transport scripts.
 CLIENT_PORTS="${CLIENT_PORTS:-3}"
 PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
 PORT_THREADS="${PORT_THREADS:-3}"

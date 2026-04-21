@@ -2,6 +2,17 @@
 
 from cperf import *
 
+DEFAULTS_25G = {
+    "client_ports":        3,
+    "port_receivers":      3,
+    "port_threads":        3,
+    "server_ports":        3,
+    "tcp_client_ports":    4,
+    "tcp_port_receivers":  1,
+    "tcp_port_threads":    1,
+    "tcp_server_ports":    8,
+}
+
 VARIANTS = [
     {
         "name": "dctcp",
@@ -103,6 +114,7 @@ parser = get_parser(description=
         'variants including TFO, pooling, HTTP/2-style multiplexing, '
         'staggered starts, and load-aware scheduling.',
         usage='%(prog)s [options]')
+parser.set_defaults(**DEFAULTS_25G)
 parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
         default=0, help="If nonzero, clients and servers will be segregated "
         "and this value indicates the number of server nodes; all other "
@@ -127,10 +139,6 @@ else:
     options.num_clients = options.num_nodes - options.num_servers
     servers = range(0, options.num_servers)
     clients = range(options.num_servers, options.num_nodes)
-    options.server_ports = options.server_ports * 2
-    options.client_ports = options.client_ports * 2
-    options.tcp_server_ports = options.tcp_server_ports * 2
-    options.tcp_client_ports = options.tcp_client_ports * 2
     bw_multiplier = min(options.num_servers, options.num_clients) / options.num_clients
 
 if options.workload != "":

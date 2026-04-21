@@ -33,6 +33,10 @@ export RESULTS_SUBDIR="${RESULTS_SUBDIR:-tuned}"
 export SUMMARY_TITLE="${SUMMARY_TITLE:-Tuned baseline Summary}"
 export TCP="${TCP:-false}"
 export DCTCP="${DCTCP:-true}"
+export CLIENT_PORTS="${CLIENT_PORTS:-3}"
+export PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
+export PORT_THREADS="${PORT_THREADS:-3}"
+export SERVER_PORTS="${SERVER_PORTS:-3}"
 export TCP_CLIENT_POOLING="${TCP_CLIENT_POOLING:-true}"
 export TCP_HTTP2="${TCP_HTTP2:-true}"
 export TCP_HTTP2_SESSIONS="${TCP_HTTP2_SESSIONS:-4}"
@@ -40,6 +44,8 @@ export TCP_FASTOPEN="${TCP_FASTOPEN:-false}"
 export TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
 export TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
 export TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
+export TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
+export TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
 
 forwarded=()
 show_help=false
@@ -74,6 +80,8 @@ export TCP_CLIENT_PORTS
 export TCP_HTTP2_SESSIONS
 export TCP_POOL_SIZE
 export TCP_PORT_RECEIVERS
+export TCP_PORT_THREADS
+export TCP_SERVER_PORTS
 export TCP_FASTOPEN
 
 if [[ "$show_help" == true ]]; then
