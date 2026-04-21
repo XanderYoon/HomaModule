@@ -18,6 +18,7 @@
 # tests for the Linux kernel implementation of Homa.
 
 import argparse
+import bisect
 import copy
 import datetime
 import glob
@@ -44,6 +45,9 @@ if platform.system() != "Windows":
 
 SSH_OPTIONS = ["-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR",
         "-o", "UserKnownHostsFile=/dev/null"]
+
+# 20,000,000% expressed on the slowdown axis.
+P99_SLOWDOWN_MAX = 200000
 
 # If a server's id appears as a key in this dictionary, it means we
 # have started cp_node running on that node. The value of each entry is
@@ -127,7 +131,7 @@ default_defaults = {
     # Note: very large numbers for client_max hurt Homa throughput with
     # unlimited load (throttle queue inserts take a long time).
     'client_max':          200,
-    'client_ports':        3,
+    'client_ports':        4,
     'log_dir':             'logs/' + time.strftime('%Y%m%d%H%M%S'),
     'mtu':                 0,
     'no_trunc':            '',
@@ -135,7 +139,9 @@ default_defaults = {
     'port_receivers':      3,
     'port_threads':        3,
     'seconds':             5,
-    'server_ports':        3,
+    'samples':             5,
+    'sample_cooldown':     5,
+    'server_ports':        4,
     'tcp_client_ports':    4,
     'tcp_fastopen':        False,
     'tcp_http2':           False,
@@ -143,12 +149,13 @@ default_defaults = {
     'tcp_loss_percent':    0.0,
     'tcp_load_aware':      False,
     'tcp_port_receivers':  1,
-    'tcp_server_ports':    8,
+    'tcp_server_ports':    4,
     'tcp_stagger_us':      0,
     'tcp_port_threads':    1,
     'unloaded':            0,
     'unsched':             0,
     'unsched_boost':       0.0,
+    'variant_cooldown':    5,
     'workload':            ''
 }
 
@@ -177,6 +184,9 @@ qdisc_digests = {}
 # Keys are experiment names, and each value is parsed aggregate TCP counter
 # data for that experiment.
 tcp_counter_digests = {}
+
+# Tracks how many repeated samples have been collected for each experiment.
+experiment_runs = {}
 
 # A dictionary where keys are message lengths, and each value is the median
 # unloaded RTT (usecs) for messages of that length.
@@ -234,6 +244,7 @@ def log(message):
     print(message)
     log_file.write(message)
     log_file.write("\n")
+    log_file.flush()
 
 def vlog(message):
     """
@@ -247,6 +258,20 @@ def vlog(message):
         print(message)
     log_file.write(message)
     log_file.write("\n")
+    log_file.flush()
+
+def checkpoint(label):
+    """
+    Flush logs and record a checkpoint marker for long-running experiments.
+    """
+    global log_dir, log_file
+    log("Checkpoint: %s" % (label))
+    with open("%s/reports/checkpoints.log" % (log_dir), "a") as f:
+        f.write("%s %s\n" % (date_time, label))
+        f.flush()
+        os.fsync(f.fileno())
+    log_file.flush()
+    os.fsync(log_file.fileno())
 
 def get_parser(description, usage, defaults = {}):
     """
@@ -319,6 +344,14 @@ def get_parser(description, usage, defaults = {}):
             metavar='S', default=defaults['seconds'],
             help='Run each experiment for S seconds (default: %.1f)'
             % (defaults['seconds']))
+    parser.add_argument('--samples', type=int, dest='samples',
+            metavar='count', default=defaults['samples'],
+            help='Number of repeated samples to collect for each experiment '
+            '(default: %d)' % (defaults['samples']))
+    parser.add_argument('--sample-cooldown', type=int, dest='sample_cooldown',
+            metavar='S', default=defaults['sample_cooldown'],
+            help='Seconds to wait between repeated samples of the same variant '
+            '(default: %d)' % (defaults['sample_cooldown']))
     parser.add_argument('--server-ports', type=int, dest='server_ports',
             metavar='count', default=defaults['server_ports'],
             help='Number of ports on which each server should listen '
@@ -378,6 +411,10 @@ def get_parser(description, usage, defaults = {}):
             help='Increase the number of unscheduled priorities that homa_prio '
             'assigns by this (possibly fractional) amount (default: %.2f)'
             % (defaults['unsched_boost']))
+    parser.add_argument('--variant-cooldown', type=int, dest='variant_cooldown',
+            metavar='S', default=defaults['variant_cooldown'],
+            help='Seconds to wait between variants (default: %d)'
+            % (defaults['variant_cooldown']))
     parser.add_argument('-v', '--verbose', dest='verbose', action='store_true',
             help='Enable verbose output in node logs')
     parser.add_argument('-w', '--workload', dest='workload',
@@ -392,10 +429,12 @@ def init(options):
     Initialize various global state, such as the log file.
     """
     global digests, qdisc_digests, tcp_counter_digests, unloaded_p50
+    global experiment_runs
     global log_dir, log_file, verbose
     digests = {}
     qdisc_digests = {}
     tcp_counter_digests = {}
+    experiment_runs = {}
     unloaded_p50.clear()
     log_dir = options.log_dir
     if not options.plot_only:
@@ -913,9 +952,12 @@ def run_experiment(name, clients, options):
                   workload
     """
 
-    global active_nodes
+    global active_nodes, experiment_runs
     start_nodes(clients, options)
     nodes = []
+    sample = experiment_runs.get(name, 0)
+    experiment_runs[name] = sample + 1
+    file_name = "%s-%d" % (name, sample)
     log("Starting %s experiment with clients %d:%d" % (
             name, clients.start, clients.stop-1))
     num_servers = len(server_nodes)
@@ -1007,7 +1049,7 @@ def run_experiment(name, clients, options):
     if options.protocol != "homa":
         tcp_counter_after = collect_tcp_counters(all_tcp_nodes)
         tcp_qdisc_after = collect_qdisc_stats(all_tcp_nodes)
-        write_tcp_counter_reports(name,
+        write_tcp_counter_reports(file_name,
                 diff_tcp_counters(tcp_counter_before, tcp_counter_after),
                 tcp_qdisc_after)
     if not "no_rtt_files" in options:
@@ -1015,12 +1057,12 @@ def run_experiment(name, clients, options):
     if options.protocol == "homa":
         vlog("Recording final metrics")
         for id in active_nodes:
-            f = open("%s/%s-%d.metrics" % (options.log_dir, name, id), 'w')
+            f = open("%s/%s-%d.metrics" % (options.log_dir, file_name, id), 'w')
             subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % (id),
                     "metrics.py"], stdout=f);
             f.close()
-        shutil.copyfile("%s/%s-%d.metrics" % (options.log_dir, name, first_server),
-                "%s/reports/%s.metrics" % (options.log_dir, name))
+        shutil.copyfile("%s/%s-%d.metrics" % (options.log_dir, file_name, first_server),
+                "%s/reports/%s.metrics" % (options.log_dir, file_name))
     do_cmd("stop senders", clients)
     if False and "dctcp" in name:
         do_cmd("tt print cp.tt", clients)
@@ -1031,7 +1073,8 @@ def run_experiment(name, clients, options):
     if not "no_rtt_files" in options:
         for id in clients:
             subprocess.run(["rsync", "-rtvq", "node-%d:rtts" % (id),
-                    "%s/%s-%d.rtts" % (options.log_dir, name, id)])
+                    "%s/%s-%d.rtts" % (options.log_dir, file_name, id)])
+    checkpoint("sample complete %s" % (file_name))
 
 def scan_log(file, node, experiments):
     """
@@ -1270,6 +1313,25 @@ def read_rtts(file, rtts):
     f.close()
     return total
 
+def rtt_sample_map(experiment):
+    """
+    Group RTT files for an experiment by repeated sample index.
+
+    For new filenames, files are named experiment-sample-node.rtts.
+    Legacy filenames use experiment-node.rtts and are treated as one sample.
+    """
+    files = sorted(glob.glob(log_dir + ("/%s-*.rtts" % (experiment))))
+    samples = {}
+    new_style = re.compile(re.escape(experiment) + r"-(\d+)-(\d+)\.rtts$")
+    for file in files:
+        base = os.path.basename(file)
+        match = new_style.match(base)
+        sample = int(match.group(1)) if match else 0
+        if sample not in samples:
+            samples[sample] = []
+        samples[sample].append(file)
+    return samples
+
 def get_buckets(rtts, total):
     """
     Generates buckets for histogramming the information in rtts.
@@ -1297,6 +1359,65 @@ def get_buckets(rtts, total):
             bucket_samples = 0
     return buckets
 
+def digest_from_rtts(rtts, total_messages, buckets):
+    """
+    Compute bucketed RTT/slowdown statistics for a single sample.
+    """
+    digest = {
+        "rtts": rtts,
+        "total_messages": total_messages,
+        "lengths": [],
+        "cum_frac": [],
+        "counts": [],
+        "p50": [],
+        "p99": [],
+        "p999": [],
+        "slow_50": [],
+        "slow_99": [],
+        "slow_999": [],
+    }
+    if total_messages == 0 or len(buckets) == 0:
+        return digest
+
+    bucket_length, bucket_cum_frac = buckets[0]
+    next_bucket = 1
+    bucket_rtts = []
+    bucket_slowdowns = []
+    bucket_count = 0
+    cur_unloaded = unloaded_p50[min(unloaded_p50.keys())]
+    lengths = sorted(rtts.keys())
+    lengths.append(999999999)
+    for length in lengths:
+        if length > bucket_length:
+            digest["lengths"].append(bucket_length)
+            digest["cum_frac"].append(bucket_cum_frac)
+            digest["counts"].append(bucket_count)
+            if len(bucket_rtts) == 0:
+                bucket_rtts.append(0)
+                bucket_slowdowns.append(0)
+            bucket_rtts = sorted(bucket_rtts)
+            digest["p50"].append(bucket_rtts[bucket_count//2])
+            digest["p99"].append(bucket_rtts[bucket_count*99//100])
+            digest["p999"].append(bucket_rtts[bucket_count*999//1000])
+            bucket_slowdowns = sorted(bucket_slowdowns)
+            digest["slow_50"].append(bucket_slowdowns[bucket_count//2])
+            digest["slow_99"].append(bucket_slowdowns[bucket_count*99//100])
+            digest["slow_999"].append(bucket_slowdowns[bucket_count*999//1000])
+            if next_bucket >= len(buckets):
+                break
+            bucket_rtts = []
+            bucket_slowdowns = []
+            bucket_count = 0
+            bucket_length, bucket_cum_frac = buckets[next_bucket]
+            next_bucket += 1
+        if length in unloaded_p50:
+            cur_unloaded = unloaded_p50[length]
+        bucket_count += len(rtts[length])
+        for rtt in rtts[length]:
+            bucket_rtts.append(rtt)
+            bucket_slowdowns.append(rtt/cur_unloaded)
+    return digest
+
 def set_unloaded(experiment):
     """
     Compute the optimal RTTs for each message size.
@@ -1305,12 +1426,13 @@ def set_unloaded(experiment):
     """
     
     # Find (or generate) unloaded data for comparison.
-    files = sorted(glob.glob("%s/%s-*.rtts" % (log_dir, experiment)))
-    if len(files) == 0:
+    sample_files = rtt_sample_map(experiment)
+    if len(sample_files) == 0:
         raise Exception("Couldn't find %s RTT data" % (experiment))
     rtts = {}
-    for file in files:
-        read_rtts(file, rtts)
+    for files in sample_files.values():
+        for file in files:
+            read_rtts(file, rtts)
     unloaded_p50.clear()
     for length in rtts.keys():
         unloaded_p50[length] = sorted(rtts[length])[len(rtts[length])//2]
@@ -1343,17 +1465,24 @@ def get_digest(experiment):
     digest["slow_99"] = []
     digest["slow_999"] = []
 
-    # Read in the RTT files for this experiment.
-    files = sorted(glob.glob(log_dir + ("/%s-*.rtts" % (experiment))))
-    if len(files) == 0:
+    # Read in the RTT files for this experiment, grouped by repeated sample.
+    sample_files = rtt_sample_map(experiment)
+    if len(sample_files) == 0:
         raise Exception("Couldn't find RTT data for %s experiment"
                 % (experiment))
     sys.stdout.write("Reading RTT data for %s experiment: " % (experiment))
     sys.stdout.flush()
-    for file in files:
-        digest["total_messages"] += read_rtts(file, digest["rtts"])
-        sys.stdout.write("#")
-        sys.stdout.flush()
+    sample_rtts = {}
+    sample_totals = {}
+    for sample, files in sample_files.items():
+        sample_rtts[sample] = {}
+        sample_totals[sample] = 0
+        for file in files:
+            count = read_rtts(file, sample_rtts[sample])
+            sample_totals[sample] += count
+            digest["total_messages"] += count
+            sys.stdout.write("#")
+            sys.stdout.flush()
     print("")
 
     report_path = "%s/reports/%s.data" % (log_dir, experiment)
@@ -1377,6 +1506,11 @@ def get_digest(experiment):
         raise Exception("No unloaded data: must invoked set_unloaded")
 
     rtts = digest["rtts"]
+    for sample in sample_rtts:
+        for length, values in sample_rtts[sample].items():
+            digest["rtts"].setdefault(length, [])
+            digest["rtts"][length].extend(values)
+    rtts = digest["rtts"]
     buckets = get_buckets(rtts, digest["total_messages"])
     if len(buckets) == 0:
         log("WARNING: no histogram buckets generated for %s; leaving digest "
@@ -1384,49 +1518,34 @@ def get_digest(experiment):
         write_empty_digest("No histogram buckets could be generated for this experiment")
         digests[experiment] = digest
         return digest
-    bucket_length, bucket_cum_frac = buckets[0]
-    next_bucket = 1
-    bucket_rtts = []
-    bucket_slowdowns = []
-    bucket_count = 0
-    cur_unloaded = unloaded_p50[min(unloaded_p50.keys())]
-    lengths = sorted(rtts.keys())
-    lengths.append(999999999)            # Force one extra loop iteration
-    for length in lengths:
-        if length > bucket_length:
-            digest["lengths"].append(bucket_length)
-            digest["cum_frac"].append(bucket_cum_frac)
-            digest["counts"].append(bucket_count)
-            if len(bucket_rtts) == 0:
-                bucket_rtts.append(0)
-                bucket_slowdowns.append(0)
-            bucket_rtts = sorted(bucket_rtts)
-            digest["p50"].append(bucket_rtts[bucket_count//2])
-            digest["p99"].append(bucket_rtts[bucket_count*99//100])
-            digest["p999"].append(bucket_rtts[bucket_count*999//1000])
-            bucket_slowdowns = sorted(bucket_slowdowns)
-            digest["slow_50"].append(bucket_slowdowns[bucket_count//2])
-            digest["slow_99"].append(bucket_slowdowns[bucket_count*99//100])
-            digest["slow_999"].append(bucket_slowdowns[bucket_count*999//1000])
-            if next_bucket >= len(buckets):
-                break
-            bucket_rtts = []
-            bucket_slowdowns = []
-            bucket_count = 0
-            bucket_length, bucket_cum_frac = buckets[next_bucket]
-            next_bucket += 1
-        if length in unloaded_p50:
-            cur_unloaded = unloaded_p50[length]
-        bucket_count += len(rtts[length])
-        for rtt in rtts[length]:
-            bucket_rtts.append(rtt)
-            bucket_slowdowns.append(rtt/cur_unloaded)
+    pooled = digest_from_rtts(rtts, digest["total_messages"], buckets)
+    digest["lengths"] = pooled["lengths"]
+    digest["cum_frac"] = pooled["cum_frac"]
+    digest["counts"] = pooled["counts"]
+    sample_digests = []
+    for sample in sorted(sample_rtts.keys()):
+        sample_digests.append(digest_from_rtts(sample_rtts[sample],
+                sample_totals[sample], buckets))
+    for field in ["p50", "p99", "p999", "slow_50", "slow_99", "slow_999"]:
+        averaged = []
+        for i in range(len(digest["lengths"])):
+            values = []
+            for sample_digest in sample_digests:
+                if i < len(sample_digest[field]) and sample_digest["counts"][i] > 0:
+                    values.append(sample_digest[field][i])
+            if len(values) == 0:
+                averaged.append(0)
+            else:
+                averaged.append(sum(values)/len(values))
+        digest[field] = averaged
     log("Digest finished for %s" % (experiment))
 
     dir = "%s/reports" % (log_dir)
     f = open(report_path, "w")
     f.write("# Digested data for %s experiment, run at %s\n"
             % (experiment, date_time))
+    f.write("# Averaged across %d repeated sample(s)\n"
+            % (len(sample_digests)))
     f.write("# length  cum_frac  samples     p50      p99     p999   "
             "s50    s99    s999\n")
     for i in range(len(digest["lengths"])):
@@ -1517,29 +1636,34 @@ def get_tcp_counter_digest(experiment):
         "ce_packets": 0,
         "retrans_segments": 0,
     }
-    path = "%s/reports/%s.tcp_counters" % (log_dir, experiment)
-    if not os.path.exists(path):
+    paths = sorted(glob.glob("%s/reports/%s-*.tcp_counters" % (log_dir, experiment)))
+    if len(paths) == 0:
+        path = "%s/reports/%s.tcp_counters" % (log_dir, experiment)
+        if os.path.exists(path):
+            paths = [path]
+    if len(paths) == 0:
         tcp_counter_digests[experiment] = digest
         return digest
 
     digest["exists"] = True
-    for line in open(path):
-        stripped = line.strip()
-        if stripped == "":
-            break
-        if stripped.startswith("#"):
-            continue
-        match = re.match(r"(\S+)\s+(-?\d+)$", stripped)
-        if not match:
-            continue
-        name = match.group(1)
-        value = int(match.group(2))
-        if name == "IpExtInECT0Pkts":
-            digest["ect_packets"] = value
-        elif name == "IpExtInCEPkts":
-            digest["ce_packets"] = value
-        elif name == "TcpRetransSegs":
-            digest["retrans_segments"] = value
+    for path in paths:
+        for line in open(path):
+            stripped = line.strip()
+            if stripped == "":
+                break
+            if stripped.startswith("#"):
+                continue
+            match = re.match(r"(\S+)\s+(-?\d+)$", stripped)
+            if not match:
+                continue
+            name = match.group(1)
+            value = int(match.group(2))
+            if name == "IpExtInECT0Pkts":
+                digest["ect_packets"] += value
+            elif name == "IpExtInCEPkts":
+                digest["ce_packets"] += value
+            elif name == "TcpRetransSegs":
+                digest["retrans_segments"] += value
 
     tcp_counter_digests[experiment] = digest
     return digest
@@ -1965,27 +2089,44 @@ def get_short_cdf(experiment):
                  of y-coords) that histogram the complementary cdf.
     """
     global log_dir, date_time
-    short = []
+
+    def extract_short_rtts(rtts, total_messages):
+        short = []
+        if total_messages == 0:
+            return short, 0
+        messages_left = total_messages//10
+        longest = 0
+        for length in sorted(rtts.keys()):
+            if (length >= 1500) and (len(short) > 0):
+                break
+            short.extend(rtts[length])
+            messages_left -= len(rtts[length])
+            longest = length
+            if messages_left < 0:
+                break
+        return sorted(short), longest
+
     digest = get_digest(experiment)
-    rtts = digest["rtts"]
     if digest["total_messages"] == 0:
         return [[], []]
-    messages_left = digest["total_messages"]//10
+    sample_files = rtt_sample_map(experiment)
+    sample_shorts = []
     longest = 0
-    for length in sorted(rtts.keys()):
-        if (length >= 1500) and (len(short) > 0):
-            break
-        short.extend(rtts[length])
-        messages_left -= len(rtts[length])
-        longest = length
-        if messages_left < 0:
-            break
+    for files in sample_files.values():
+        rtts = {}
+        total_messages = 0
+        for file in files:
+            total_messages += read_rtts(file, rtts)
+        short, sample_longest = extract_short_rtts(rtts, total_messages)
+        if len(short) == 0:
+            continue
+        sample_shorts.append(short)
+        longest = max(longest, sample_longest)
     vlog("Largest message used for short CDF for %s: %d"
             % (experiment, longest))
     x = []
     y = []
-    total = len(short)
-    if total == 0:
+    if len(sample_shorts) == 0:
         f = open("%s/reports/%s_cdf.data" % (log_dir, experiment), "w")
         f.write("# Fraction of RTTS longer than a given time for %s experiment\n"
                 % (experiment))
@@ -1993,12 +2134,27 @@ def get_short_cdf(experiment):
                 % (date_time))
         f.close()
         return [[], []]
-    remaining = total
+    points = []
+    if len(sample_shorts) == 1:
+        total = len(sample_shorts[0])
+        remaining = total
+        for rtt in sample_shorts[0]:
+            remaining -= 1
+            points.append((rtt, remaining/total))
+    else:
+        union = sorted(set(rtt for short in sample_shorts for rtt in short))
+        for rtt in union:
+            fracs = []
+            for short in sample_shorts:
+                remaining = len(short) - bisect.bisect_right(short, rtt)
+                fracs.append(remaining/len(short))
+            points.append((rtt, sum(fracs)/len(fracs)))
     f = open("%s/reports/%s_cdf.data" % (log_dir, experiment), "w")
     f.write("# Fraction of RTTS longer than a given time for %s experiment\n"
             % (experiment));
     f.write("# Includes messages <= %d bytes; measured at %s\n"
             % (longest, date_time))
+    f.write("# Averaged across %d repeated sample(s)\n" % (len(sample_shorts)))
     f.write("# Data collected at %s \n" % (date_time))
     f.write("#       usec        frac\n")
 
@@ -2007,9 +2163,7 @@ def get_short_cdf(experiment):
     # the last point actually graphed.
     prevx = 0
     prevy = 1.0
-    for rtt in sorted(short):
-        remaining -= 1
-        frac = remaining/total
+    for rtt, frac in points:
         if (prevy != 0) and (prevx != 0) and (abs((frac - prevy)/prevy) < .01) \
                 and (abs((rtt - prevx)/prevx) < .01):
             continue;

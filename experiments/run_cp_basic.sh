@@ -16,9 +16,10 @@ HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
 HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
 LOG_ROOT="${LOG_ROOT:-logs}"
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-$REPO_ROOT/experiments/results}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/basic"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/basic"
 LOG_DIR=""
 LOCAL_RUN_DIR=""
+LOCAL_LOG_DIR=""
 BASIC_OUTPUT=""
 SUMMARY_MD=""
 
@@ -30,12 +31,29 @@ fetch_partial_logs() {
     if [[ -z "$LOCAL_RUN_DIR" ]]; then
         return
     fi
-    mkdir -p "$LOCAL_RUN_DIR"
+    mkdir -p "$LOCAL_LOG_DIR"
     if [[ -n "$LOG_DIR" ]]; then
         rsync -e "ssh -o StrictHostKeyChecking=no" -rt \
-            "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_RUN_DIR/" \
+            "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/" \
             >/dev/null 2>&1 || true
     fi
+}
+
+promote_pdfs() {
+    if [[ -z "$LOCAL_RUN_DIR" || -z "$LOCAL_LOG_DIR" || ! -d "$LOCAL_LOG_DIR" ]]; then
+        return
+    fi
+    while IFS= read -r -d '' pdf; do
+        case "$(basename "$pdf")" in
+            vs_*.pdf|*_p50.pdf|*_p99.pdf|short_cdf_*.pdf)
+                mv "$pdf" "$LOCAL_RUN_DIR/"
+                ;;
+            *)
+                rm -f "$pdf"
+                ;;
+        esac
+    done < <(find "$LOCAL_LOG_DIR" -type f -name '*.pdf' -print0)
+    find "$LOCAL_LOG_DIR" -type d -empty -delete
 }
 
 on_error() {
@@ -46,9 +64,9 @@ on_error() {
         if [[ -s "$BASIC_OUTPUT" ]]; then
             log warn "Last cp_basic output lines"
             tail -n 40 "$BASIC_OUTPUT" || true
-        elif [[ -f "$LOCAL_RUN_DIR/reports/cperf.log" ]]; then
+        elif [[ -f "$LOCAL_LOG_DIR/reports/cperf.log" ]]; then
             log warn "No remote stdout/stderr was captured; tail of reports/cperf.log"
-            tail -n 40 "$LOCAL_RUN_DIR/reports/cperf.log" || true
+            tail -n 40 "$LOCAL_LOG_DIR/reports/cperf.log" || true
         fi
     fi
     exit "$exit_code"
@@ -111,7 +129,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --local-results-dir)
             LOCAL_RESULTS_DIR="$2"
-            RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/basic"
+            RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/basic"
             shift 2
             ;;
         -h|--help)
@@ -139,6 +157,7 @@ fi
 STAMP="$(date +%Y%m%d%H%M%S)"
 LOG_DIR="$LOG_ROOT/cp_basic_${STAMP}"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
+LOCAL_LOG_DIR="$LOCAL_RUN_DIR/logs"
 mkdir -p "$RESULTS_RUN_ROOT"
 trap 'on_error $?' ERR
 
@@ -261,10 +280,11 @@ ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && timeout $TIMEOUT_SECON
 
 log fetch "Copying cp_basic artifacts back to $LOCAL_RUN_DIR"
 fetch_partial_logs
+promote_pdfs
 ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest"
 
 SUMMARY_MD="$LOCAL_RUN_DIR/basic_summary.md"
-if find "$LOCAL_RUN_DIR" -maxdepth 1 -name 'node-*.log' | grep -q .; then
+if find "$LOCAL_LOG_DIR" -maxdepth 1 -name 'node-*.log' -print -quit | grep -q .; then
     log report "Generating saved summary table at $SUMMARY_MD"
     python3 "$REPO_ROOT/experiments/generate_cp_basic.py" \
         "$LOCAL_RUN_DIR" \
@@ -275,9 +295,9 @@ if find "$LOCAL_RUN_DIR" -maxdepth 1 -name 'node-*.log' | grep -q .; then
     sed -n '/^| Metric | Homa | TCP | DCTCP |$/,/^$/p' "$SUMMARY_MD"
 else
     log warn "Skipping summary generation because node-*.log files were not fetched"
-    if [[ -f "$LOCAL_RUN_DIR/reports/cperf.log" ]]; then
+    if [[ -f "$LOCAL_LOG_DIR/reports/cperf.log" ]]; then
         log warn "Tail of reports/cperf.log"
-        tail -n 40 "$LOCAL_RUN_DIR/reports/cperf.log"
+        tail -n 40 "$LOCAL_LOG_DIR/reports/cperf.log"
     fi
 fi
 

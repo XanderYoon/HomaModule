@@ -5,10 +5,10 @@ set -euo pipefail
 : "${BENCH_LABEL:?}"
 : "${RESULT_SUBDIR:?}"
 : "${LOG_PREFIX:?}"
-: "${VARIANT_FLAG:?}"
-: "${VARIANT_VALUE:?}"
-: "${VARIANT_HELP_NAME:?}"
-: "${VARIANT_HELP_TEXT:?}"
+: "${VARIANT_FLAG:=}"
+: "${VARIANT_VALUE:=}"
+: "${VARIANT_HELP_NAME:=}"
+: "${VARIANT_HELP_TEXT:=}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -16,18 +16,27 @@ REMOTE_USER="${CLOUDLAB_USER:-$(whoami)}"
 NODE0_ALIAS="${NODE0_ALIAS:-node0}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
-NUM_NODES="${NUM_NODES:-10}"
-RUN_SECONDS="${RUN_SECONDS:-10}"
+LINK_MBPS="${LINK_MBPS:-25000}"
+HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
+HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
+HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
+HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
+NUM_NODES="${NUM_NODES:-5}"
+RUN_SECONDS="${RUN_SECONDS:-5}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 CLIENT_MAX="${CLIENT_MAX:-200}"
-CLIENT_PORTS="${CLIENT_PORTS:-3}"
+CLIENT_PORTS="${CLIENT_PORTS:-4}"
 PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
 PORT_THREADS="${PORT_THREADS:-3}"
-SERVER_PORTS="${SERVER_PORTS:-3}"
+SERVER_PORTS="${SERVER_PORTS:-4}"
 TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
-TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-4}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
+TCP_LOSS_PERCENT="${TCP_LOSS_PERCENT:-0.200}"
+SAMPLES="${SAMPLES:-1}"
+SAMPLE_COOLDOWN="${SAMPLE_COOLDOWN:-5}"
+VARIANT_COOLDOWN="${VARIANT_COOLDOWN:-5}"
 UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
@@ -37,6 +46,9 @@ WORKLOAD="${WORKLOAD:-w4}"
 GBPS="${GBPS:-20}"
 SERVER_COUNT="${SERVER_COUNT:-1}"
 RESULTS_RUN_ROOT=""
+LOCAL_LOG_DIR=""
+SUMMARY_MD=""
+REMOTE_TIMEOUT="${REMOTE_TIMEOUT:-}"
 
 usage() {
     cat <<EOF
@@ -47,10 +59,11 @@ Optional:
                         empty means run the built-in workload set
   --gbps B              Override bandwidth for the workload
   --servers N           Layout: 0 means all nodes act as both clients
-                        and servers, 1 gives 1 server + 9 clients in the
-                        default 10-node setup (default: 1)
-  --seconds S           Duration of each experiment phase (default: 10)
+                        and servers, 1 gives 1 server + 4 clients in the
+                        default 5-node setup (default: 1)
+  --seconds S           Duration of each experiment phase (default: 5)
   --seconds-multiplier M  Scale the run duration by this factor (default: 1)
+  --link-mbps M         Homa link rate to configure on each node (default: 25000)
   --client-max N        Maximum outstanding RPCs per client machine
   --client-ports N      Homa client ports baseline parameter
   --port-receivers N    Homa receiver threads baseline parameter
@@ -60,19 +73,81 @@ Optional:
   --tcp-port-receivers N  Baseline TCP receiver threads
   --tcp-server-ports N  Baseline TCP server ports
   --tcp-port-threads N  Baseline TCP server threads
+  --tcp-loss-percent F  Artificial TCP packet loss percentage
+                        applied to all tuning variants (default: 0.200)
+  --samples N           Number of repeated samples per experiment
+                        (default: 1)
+  --sample-cooldown S   Seconds to wait between repeated samples
+                        (default: 5)
+  --variant-cooldown S  Seconds to wait between variants
+                        (default: 5)
   --unsched N           Preserve run_baselines CLI compatibility
   --unsched-boost F     Preserve run_baselines CLI compatibility
   --log-root DIR        Parent directory for benchmark logs (default: logs)
   --local-results-dir D Copy finished results from node0 to this local dir
                         (default: experiments/results)
-  --num-nodes N         Total nodes in the cluster (default: 10)
+  --num-nodes N         Total nodes in the cluster (default: 5)
   --node0 HOST          SSH alias for orchestrator node (default: node0)
-  ${VARIANT_FLAG} V     ${VARIANT_HELP_TEXT}
+EOF
+    if [[ -n "$VARIANT_FLAG" ]]; then
+        printf '  %s V     %s\n' "$VARIANT_FLAG" "$VARIANT_HELP_TEXT"
+    fi
+    cat <<'EOF'
 EOF
 }
 
 log() {
     printf '\n[%s] %s\n' "$1" "$2"
+}
+
+fetch_partial_results() {
+    if [[ -z "$LOCAL_LOG_DIR" || -z "$LOG_DIR" ]]; then
+        return
+    fi
+    mkdir -p "$LOCAL_LOG_DIR"
+    rsync -e "ssh -o StrictHostKeyChecking=no" -rt \
+        "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/" \
+        >/dev/null 2>&1 || true
+}
+
+promote_pdfs() {
+    if [[ -z "$LOCAL_RUN_DIR" || -z "$LOCAL_LOG_DIR" || ! -d "$LOCAL_LOG_DIR" ]]; then
+        return
+    fi
+    while IFS= read -r -d '' pdf; do
+        case "$(basename "$pdf")" in
+            vs_*.pdf|*_p50.pdf|*_p99.pdf|short_cdf_*.pdf)
+                mv "$pdf" "$LOCAL_RUN_DIR/"
+                ;;
+            *)
+                rm -f "$pdf"
+                ;;
+        esac
+    done < <(find "$LOCAL_LOG_DIR" -type f -name '*.pdf' -print0)
+    find "$LOCAL_LOG_DIR" -type d -empty -delete
+}
+
+generate_summary_if_possible() {
+    SUMMARY_MD="$LOCAL_RUN_DIR/summary.md"
+    if [[ -d "$LOCAL_LOG_DIR" ]] && find "$LOCAL_LOG_DIR" -type f -print -quit | grep -q .; then
+        log report "Generating saved summary table at $SUMMARY_MD"
+        python3 "$REPO_ROOT/experiments/generate_dctcp_tuning_summary.py" \
+            "$LOCAL_RUN_DIR" \
+            --output "$SUMMARY_MD" \
+            --title "${BENCH_LABEL} Summary" || true
+    else
+        log warn "Skipping summary generation because no result artifacts were fetched"
+    fi
+}
+
+on_error() {
+    local exit_code="$1"
+    log warn "${BENCH_LABEL} run failed; fetching any partial results to $LOCAL_RUN_DIR"
+    fetch_partial_results
+    promote_pdfs
+    ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest" 2>/dev/null || true
+    generate_summary_if_possible
+    exit "$exit_code"
 }
 
 require_cmd() {
@@ -95,6 +170,11 @@ normalize_workload() {
 }
 
 while [[ $# -gt 0 ]]; do
+    if [[ -n "$VARIANT_FLAG" && "$1" == "$VARIANT_FLAG" ]]; then
+        VARIANT_VALUE="$2"
+        shift 2
+        continue
+    fi
     case "$1" in
         --workload)
             WORKLOAD="$2"
@@ -114,6 +194,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --seconds-multiplier)
             SECONDS_MULTIPLIER="$2"
+            shift 2
+            ;;
+        --link-mbps)
+            LINK_MBPS="$2"
             shift 2
             ;;
         --client-max)
@@ -152,6 +236,22 @@ while [[ $# -gt 0 ]]; do
             TCP_PORT_THREADS="$2"
             shift 2
             ;;
+        --tcp-loss-percent)
+            TCP_LOSS_PERCENT="$2"
+            shift 2
+            ;;
+        --samples)
+            SAMPLES="$2"
+            shift 2
+            ;;
+        --sample-cooldown)
+            SAMPLE_COOLDOWN="$2"
+            shift 2
+            ;;
+        --variant-cooldown)
+            VARIANT_COOLDOWN="$2"
+            shift 2
+            ;;
         --unsched)
             UNSCHED="$2"
             shift 2
@@ -174,10 +274,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --node0)
             NODE0_ALIAS="$2"
-            shift 2
-            ;;
-        "${VARIANT_FLAG}")
-            VARIANT_VALUE="$2"
             shift 2
             ;;
         -h|--help)
@@ -209,6 +305,9 @@ fi
 require_cmd ssh
 require_cmd rsync
 require_cmd date
+require_cmd python3
+
+BENCH_PS_PATTERN="[${BENCH_SCRIPT:0:1}]${BENCH_SCRIPT:1}"
 
 STAMP="$(date +%Y%m%d%H%M%S)"
 TOPOLOGY_TAG="allnodes"
@@ -217,9 +316,11 @@ if (( SERVER_COUNT > 0 )); then
 fi
 WORKLOAD_TAG="${WORKLOAD:-allworkloads}"
 LOG_DIR="$LOG_ROOT/${LOG_PREFIX}_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/$RESULT_SUBDIR"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/$RESULT_SUBDIR"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
+LOCAL_LOG_DIR="$LOCAL_RUN_DIR/logs"
 mkdir -p "$RESULTS_RUN_ROOT"
+trap 'on_error $?' ERR
 
 log sync "Pushing updated ${BENCH_LABEL} sources to $NODE0_ALIAS"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
@@ -233,7 +334,7 @@ ssh "$NODE0_ALIAS" "chmod 755 $REMOTE_REPO_DIR/util/$BENCH_SCRIPT"
 log cleanup "Stopping stale benchmark processes on node0"
 ssh "$NODE0_ALIAS" "
     set -euo pipefail
-    pkill -f '$BENCH_SCRIPT' >/dev/null 2>&1 || true
+    ps -ef | awk '/$BENCH_PS_PATTERN/ {print \$2}' | xargs -r kill >/dev/null 2>&1 || true
     ps -ef | awk '/[c]p_node/ {print \$2}' | xargs -r kill >/dev/null 2>&1 || true
 "
 
@@ -256,9 +357,13 @@ ssh "$NODE0_ALIAS" "
     sudo apt-get update
     sudo apt-get install -y python3 python3-numpy python3-matplotlib rsync ethtool linux-tools-common linux-tools-generic
     cd $REMOTE_REPO_DIR
+    make -j
     make -C util clean
     make -C util -j
+    cp cloudlab/bin/* ~/bin/
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/homa.ko ~/bin/homa.ko
     /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
     /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/*.py ~/bin/
     chmod +x ~/bin/*
     cp cloudlab/bashrc ~/.bashrc
@@ -279,11 +384,18 @@ for i in $(seq 1 $((NUM_NODES-1))); do
     "
 done
 
-log setup "Copying runtime files to node-0 through node-$((NUM_NODES-1))"
-ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$NUM_NODES" <<'EOF'
+log setup "Copying runtime files to node-0 through node-$((NUM_NODES-1)) and loading Homa"
+ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$NUM_NODES" \
+    "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" "$HOMA_RTT_BYTES" \
+    "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
 set -euo pipefail
 remote_repo_dir="$1"
 num_nodes="$2"
+link_mbps="$3"
+max_nic_queue_ns="$4"
+rtt_bytes="$5"
+grant_increment="$6"
+max_gso_size="$7"
 node0_pubkey="$(cat ~/.ssh/id_ed25519.pub)"
 private_ip_pattern='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
 
@@ -305,12 +417,12 @@ for i in $(seq 0 $((num_nodes-1))); do
     ssh "$node" "mkdir -p ~/bin ~/.ssh"
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv ~/.bashrc ~/.bash_profile "$node:"
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
-        util/cp_node util/*.py "$node:/tmp/"
+        homa.ko util/cp_node util/homa_prio util/*.py "$node:/tmp/"
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
         /tmp/homa_node_hosts "$node:/tmp/homa_node_hosts"
     ssh "$node" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qxF '$node0_pubkey' ~/.ssh/authorized_keys 2>/dev/null || printf '%s\n' '$node0_pubkey' >> ~/.ssh/authorized_keys"
-    ssh "$node" "/usr/bin/install -m 755 /tmp/cp_node ~/bin/cp_node && /usr/bin/install -m 755 /tmp/*.py ~/bin/ && sudo /usr/bin/install -m 755 /tmp/cp_node /usr/bin/cp_node && sudo /usr/bin/install -m 755 /tmp/*.py /usr/bin/"
-    ssh "$node" "sudo pkill cp_node >/dev/null 2>&1 || true; sudo sed -i '/ node-[0-9]\\b/d;/ node[0-9]\\b/d' /etc/hosts; cat /tmp/homa_node_hosts | sudo tee -a /etc/hosts >/dev/null"
+    ssh "$node" "/usr/bin/install -m 755 /tmp/homa.ko ~/bin/homa.ko && /usr/bin/install -m 755 /tmp/cp_node ~/bin/cp_node && /usr/bin/install -m 755 /tmp/homa_prio ~/bin/homa_prio && /usr/bin/install -m 755 /tmp/*.py ~/bin/ && sudo /usr/bin/install -m 755 /tmp/cp_node /usr/bin/cp_node && sudo /usr/bin/install -m 755 /tmp/homa_prio /usr/bin/homa_prio && sudo /usr/bin/install -m 755 /tmp/*.py /usr/bin/"
+    ssh "$node" "sudo pkill cp_node >/dev/null 2>&1 || true; sudo pkill homa_prio >/dev/null 2>&1 || true; sudo rmmod homa >/dev/null 2>&1 || true; sudo sed -i '/ node-[0-9]\\b/d;/ node[0-9]\\b/d' /etc/hosts; cat /tmp/homa_node_hosts | sudo tee -a /etc/hosts >/dev/null; sudo insmod ~/bin/homa.ko; sudo sysctl -w net.homa.link_mbps=$link_mbps net.homa.max_nic_queue_ns=$max_nic_queue_ns net.homa.rtt_bytes=$rtt_bytes net.homa.grant_increment=$grant_increment net.homa.max_gso_size=$max_gso_size >/dev/null"
     ssh "$node" bash -s <<'INNER'
 set -euo pipefail
 resolve_cluster_iface() {
@@ -374,17 +486,31 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_CMD="./$BENCH_SCRIPT -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $EFFECTIVE_SECONDS -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST $VARIANT_FLAG $VARIANT_VALUE"
+CP_CMD="./$BENCH_SCRIPT -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $EFFECTIVE_SECONDS --samples $SAMPLES --sample-cooldown $SAMPLE_COOLDOWN --variant-cooldown $VARIANT_COOLDOWN -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --tcp-loss-percent $TCP_LOSS_PERCENT --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+if [[ -n "$VARIANT_FLAG" ]]; then
+    CP_CMD+=" $VARIANT_FLAG $VARIANT_VALUE"
+fi
 if [[ -n "$WORKLOAD" ]]; then
     CP_CMD+=" -w $WORKLOAD"
 fi
 
 log run "Launching $BENCH_SCRIPT on $NODE0_ALIAS with --servers $SERVER_COUNT"
-ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && timeout 1800 $CP_CMD'"
+if [[ -n "$REMOTE_TIMEOUT" ]]; then
+    ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && timeout $REMOTE_TIMEOUT $CP_CMD'"
+else
+    ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && $CP_CMD'"
+fi
 
 log fetch "Copying results back to $LOCAL_RUN_DIR"
-rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
-    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_RUN_DIR/"
+fetch_partial_results
+promote_pdfs
 ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest"
+
+generate_summary_if_possible
+
+if [[ -f "$SUMMARY_MD" ]]; then
+    log summary "Saved summary table"
+    sed -n '/^## /,$p' "$SUMMARY_MD"
+fi
 
 log done "${BENCH_LABEL} complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RUN_DIR"

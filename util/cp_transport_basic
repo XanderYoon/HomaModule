@@ -86,7 +86,8 @@ def configure_variant_environment(options, variant, all_nodes):
             "3" if getattr(options, "tcp_fastopen", False) else "0",
             all_nodes)
     configure_tcp_netem(all_nodes,
-            loss_percent=variant.get("netem_loss_percent", 0.0),
+            loss_percent=variant.get("netem_loss_percent",
+            options.tcp_loss_percent),
             ecn=variant.get("netem_ecn", False))
 
 def run_homa_suite(options):

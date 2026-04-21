@@ -8,8 +8,8 @@ NODE0_ALIAS="${NODE0_ALIAS:-node0}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
 REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 START_SCRIPT="${START_SCRIPT:-generic}"
-NUM_NODES="${NUM_NODES:-10}"
-RUN_SECONDS="${RUN_SECONDS:-10}"
+NUM_NODES="${NUM_NODES:-5}"
+RUN_SECONDS="${RUN_SECONDS:-5}"
 SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
 LINK_MBPS="${LINK_MBPS:-25000}"
 HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
@@ -17,13 +17,14 @@ HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
 HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
 HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
 CLIENT_MAX="${CLIENT_MAX:-200}"
-CLIENT_PORTS="${CLIENT_PORTS:-3}"
+CLIENT_PORTS="${CLIENT_PORTS:-4}"
 PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
 PORT_THREADS="${PORT_THREADS:-3}"
-SERVER_PORTS="${SERVER_PORTS:-3}"
+SERVER_PORTS="${SERVER_PORTS:-4}"
 TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
+TCP_CLIENT_POOLING="${TCP_CLIENT_POOLING:-false}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
-TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-4}"
 TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
 UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
@@ -32,11 +33,13 @@ LOCAL_RESULTS_DIR_DEFAULT="$REPO_ROOT/experiments/results"
 LOCAL_RESULTS_DIR="$LOCAL_RESULTS_DIR_DEFAULT"
 RESULTS_RUN_ROOT=""
 WORKLOAD="${WORKLOAD:-}"
-GBPS="${GBPS:-0.0}"
+GBPS="${GBPS:-20}"
 TCP="false"
 DCTCP="true"
 SERVER_COUNT="${SERVER_COUNT:-1}"
 TCP_LOSS_PERCENT="${TCP_LOSS_PERCENT:-0.200}"
+LOCAL_LOG_DIR=""
+SUMMARY_MD=""
 
 usage() {
     cat <<'EOF'
@@ -47,10 +50,10 @@ Optional:
                         empty means run the built-in workload set
   --gbps B              Override bandwidth for the workload
   --servers N           cp_vs_tcp server layout: 0 means all nodes act as
-                        both clients and servers, 1 gives 1 server + 9
-                        clients in the default 10-node setup
+                        both clients and servers, 1 gives 1 server + 4
+                        clients in the default 5-node setup
                         (default: 1)
-  --seconds S           Duration of each experiment phase (default: 10)
+  --seconds S           Duration of each experiment phase (default: 5)
   --seconds-multiplier M  Scale the run duration by this factor (default: 1)
   --tcp BOOL            Run the regular TCP comparison too (default: false)
   --dctcp BOOL          Run the DCTCP comparison (default: true)
@@ -60,17 +63,17 @@ Optional:
                         (default: generic)
   --local-results-dir D Copy finished results from node0 to this local dir
                         (default: experiments/results)
-  --num-nodes N         Total nodes in the cluster (default: 10)
+  --num-nodes N         Total nodes in the cluster (default: 5)
   --node0 HOST          SSH alias for orchestrator node (default: node0)
 
 Environment overrides:
   CLOUDLAB_USER, REMOTE_REPO_DIR, REMOTE_COMPAT_REPO_LINK,
   START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS,
-  TCP_LOSS_PERCENT
+  TCP_LOSS_PERCENT, TCP_CLIENT_POOLING
 
 Notes:
-  - Run ssh_setup/ssh_setup_10nodes.sh first so node aliases and key-based SSH are configured.
-  - By default, this script uses the dedicated-server 10-node cp_vs_tcp layout
+  - Run ssh_setup/ssh_setup.sh first so node aliases and key-based SSH are configured.
+  - By default, this script uses the dedicated-server 5-node cp_vs_tcp layout
     (`--servers 1`).
   - Pass `--servers 0` to use the all-nodes layout instead.
   - The default startup path is 'generic', which discovers the active NIC
@@ -81,6 +84,52 @@ EOF
 
 log() {
     printf '\n[%s] %s\n' "$1" "$2"
+}
+
+promote_pdfs() {
+    if [[ -z "$LOCAL_RUN_DIR" ]]; then
+        return
+    fi
+    if [[ -z "$LOCAL_LOG_DIR" || ! -d "$LOCAL_LOG_DIR" ]]; then
+        return
+    fi
+    while IFS= read -r -d '' pdf; do
+        case "$(basename "$pdf")" in
+            vs_*.pdf|*_p50.pdf|*_p99.pdf|short_cdf_*.pdf)
+                mv "$pdf" "$LOCAL_RUN_DIR/"
+                ;;
+            *)
+                rm -f "$pdf"
+                ;;
+        esac
+    done < <(find "$LOCAL_LOG_DIR" -type f -name '*.pdf' -print0)
+    find "$LOCAL_LOG_DIR" -type d -empty -delete
+}
+
+generate_summary_if_possible() {
+    SUMMARY_MD="$LOCAL_RUN_DIR/summary.md"
+    if [[ -d "$LOCAL_LOG_DIR" ]] && find "$LOCAL_LOG_DIR" -type f -print -quit | grep -q .; then
+        log report "Generating saved summary table at $SUMMARY_MD"
+        python3 "$REPO_ROOT/experiments/generate_dctcp_tuning_summary.py" \
+            "$LOCAL_RUN_DIR" \
+            --output "$SUMMARY_MD" \
+            --title "Baselines Summary" || true
+    else
+        log warn "Skipping summary generation because no result artifacts were fetched"
+    fi
+}
+
+on_error() {
+    local exit_code="$1"
+    log warn "Baselines run failed; fetching any partial results to $LOCAL_RUN_DIR"
+    mkdir -p "$LOCAL_LOG_DIR"
+    rsync -e "ssh -o StrictHostKeyChecking=no" -rt \
+        "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/" \
+        >/dev/null 2>&1 || true
+    promote_pdfs
+    ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest" 2>/dev/null || true
+    generate_summary_if_possible
+    exit "$exit_code"
 }
 
 shell_quote() {
@@ -197,9 +246,11 @@ if (( SERVER_COUNT > 0 )); then
 fi
 WORKLOAD_TAG="${WORKLOAD:-allworkloads}"
 LOG_DIR="$LOG_ROOT/baselines_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
-RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/runs/baseline"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/baseline"
 LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
+LOCAL_LOG_DIR="$LOCAL_RUN_DIR/logs"
 mkdir -p "$RESULTS_RUN_ROOT"
+trap 'on_error $?' ERR
 log sync "Pushing updated cp_vs_tcp sources to $NODE0_ALIAS"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
     "$REPO_ROOT/util/cp_vs_tcp" \
@@ -407,7 +458,7 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --tcp-loss-percent $TCP_LOSS_PERCENT --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --tcp-loss-percent $TCP_LOSS_PERCENT --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
 if [[ -n "$WORKLOAD" ]]; then
     CP_VS_TCP_CMD+=" -w $WORKLOAD"
 fi
@@ -416,8 +467,16 @@ log run "Launching cp_vs_tcp (baselines) on $NODE0_ALIAS with --servers $SERVER_
 ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && $CP_VS_TCP_CMD'"
 
 log fetch "Copying results back to $LOCAL_RUN_DIR"
+mkdir -p "$LOCAL_LOG_DIR"
 rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
-    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_RUN_DIR/"
+    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/"
+promote_pdfs
 ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest"
+generate_summary_if_possible
+
+if [[ -f "$SUMMARY_MD" ]]; then
+    log summary "Saved summary table"
+    sed -n '/^## /,$p' "$SUMMARY_MD"
+fi
 
 log done "Baselines benchmark complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RUN_DIR"

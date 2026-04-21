@@ -21,6 +21,15 @@ from cperf import *
 
 load_info = [["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
 
+def save_plot_with_side_legend(ax, path, legend_y=1.0):
+    fig = ax.figure
+    legend = ax.legend(loc="upper left", bbox_to_anchor=(1.02, legend_y),
+            borderaxespad=0.0, prop={'size': 9})
+    fig.set_size_inches(12, 5)
+    fig.tight_layout(rect=(0, 0, 0.93, 1))
+    fig.savefig(path, bbox_inches="tight",
+            bbox_extra_artists=[legend] if legend else None)
+
 parser = get_parser(description=
         'Measures slowdown as a function of message size for Homa and TCP.',
         usage='%(prog)s [options]')
@@ -129,7 +138,7 @@ for workload, bw in load_info:
     log("Generating slowdown plot for %s" % (workload))
     title = "%s %d nodes, %.1f Gbps" % (workload.capitalize(),
             options.num_nodes, bw)
-    ax = start_slowdown_plot(title, 1000, homa_exp)
+    ax = start_slowdown_plot(title, 10000, homa_exp)
     if options.tcp:
         plot_slowdown(ax, tcp_exp, "p99", "TCP P99", color=tcp_color)
         plot_slowdown(ax, tcp_exp, "p50", "TCP P50", color=tcp_color2)
@@ -138,9 +147,28 @@ for workload, bw in load_info:
         plot_slowdown(ax, dctcp_exp, "p50", "DCTCP P50", color=dctcp_color2)
     plot_slowdown(ax, homa_exp, "p99", "Homa P99", color=homa_color)
     plot_slowdown(ax, homa_exp, "p50", "Homa P50", color=homa_color2)
-    ax.legend(loc="upper right", prop={'size': 9})
-    plt.tight_layout()
-    plt.savefig("%s/reports/vs_tcp_%s.pdf" % (options.log_dir, workload))
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_tcp_%s.pdf" % (options.log_dir, workload))
+
+    log("Generating P50 slowdown plot for %s" % (workload))
+    ax = start_slowdown_plot(title + " P50", 10000, homa_exp)
+    if options.tcp:
+        plot_slowdown(ax, tcp_exp, "p50", "TCP P50", color=tcp_color2)
+    if options.dctcp:
+        plot_slowdown(ax, dctcp_exp, "p50", "DCTCP P50", color=dctcp_color2)
+    plot_slowdown(ax, homa_exp, "p50", "Homa P50", color=homa_color2)
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_tcp_%s_p50.pdf" % (options.log_dir, workload))
+
+    log("Generating P99 slowdown plot for %s" % (workload))
+    ax = start_slowdown_plot(title + " P99", P99_SLOWDOWN_MAX, homa_exp)
+    if options.tcp:
+        plot_slowdown(ax, tcp_exp, "p99", "TCP P99", color=tcp_color)
+    if options.dctcp:
+        plot_slowdown(ax, dctcp_exp, "p99", "DCTCP P99", color=dctcp_color)
+    plot_slowdown(ax, homa_exp, "p99", "Homa P99", color=homa_color)
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_tcp_%s_p99.pdf" % (options.log_dir, workload))
 
     # Generate CDF of small-message RTTs.
     log("Generating short message CDF for %s" % (workload))
@@ -158,5 +186,6 @@ for workload, bw in load_info:
         plt.plot(dctcp_x, dctcp_y, label="DCTCP", color=dctcp_color)
     plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
     plt.plot(unloaded_x, unloaded_y, label="Homa best case", color=unloaded_color)
-    plt.legend(loc="upper right", prop={'size': 9})
-    plt.savefig("%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload))
+    ax = plt.gca()
+    save_plot_with_side_legend(ax,
+            "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload))

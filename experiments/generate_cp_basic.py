@@ -252,8 +252,8 @@ def parse_args():
     parser.add_argument(
         "run_dir",
         nargs="?",
-        default="experiments/results/runs/baseline/latest",
-        help="Path to a fetched cp_basic run directory (default: baseline/latest)",
+        default="experiments/results/basic/latest",
+        help="Path to a fetched cp_basic run directory (default: basic/latest)",
     )
     parser.add_argument(
         "--output",
@@ -291,8 +291,13 @@ def resolve_run_dir(run_arg: str) -> Path:
     return run_dir.resolve()
 
 
+def logs_dir(run_dir: Path) -> Path:
+    candidate = run_dir / "logs"
+    return candidate if candidate.is_dir() else run_dir
+
+
 def parse_num_servers(run_dir: Path) -> int | None:
-    cperf_log = run_dir / "reports" / "cperf.log"
+    cperf_log = logs_dir(run_dir) / "reports" / "cperf.log"
     if not cperf_log.exists():
         return None
     text = cperf_log.read_text()
@@ -306,7 +311,7 @@ def parse_num_servers(run_dir: Path) -> int | None:
 
 
 def parse_num_nodes(run_dir: Path) -> int | None:
-    cperf_log = run_dir / "reports" / "cperf.log"
+    cperf_log = logs_dir(run_dir) / "reports" / "cperf.log"
     if not cperf_log.exists():
         return None
     text = cperf_log.read_text()
@@ -414,7 +419,8 @@ def main():
     if not run_dir.exists():
         raise SystemExit(f"run directory not found: {run_dir}")
 
-    node_logs = sorted(run_dir.glob("node-*.log"))
+    data_dir = logs_dir(run_dir)
+    node_logs = sorted(data_dir.glob("node-*.log"))
     if not node_logs:
         raise SystemExit(f"no node logs found in {run_dir}")
 
