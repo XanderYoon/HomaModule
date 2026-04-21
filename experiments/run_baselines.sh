@@ -29,8 +29,8 @@ SERVER_PORTS="${SERVER_PORTS:-3}"
 TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
 TCP_CLIENT_POOLING="${TCP_CLIENT_POOLING:-false}"
 TCP_FASTOPEN="${TCP_FASTOPEN:-false}"
-TCP_HTTP2="${TCP_HTTP2:-false}"
-TCP_HTTP2_SESSIONS="${TCP_HTTP2_SESSIONS:-1}"
+TCP_MULTIPLEX="${TCP_MULTIPLEX:-false}"
+TCP_MULTIPLEX_SESSIONS="${TCP_MULTIPLEX_SESSIONS:-1}"
 TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
 TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
 TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
@@ -67,9 +67,9 @@ Optional:
   --dctcp BOOL          Run the DCTCP comparison (default: true)
   --tcp-fastopen BOOL   Enable TCP Fast Open for TCP/DCTCP runs
                         (default: false)
-  --tcp-http2 BOOL      Enable HTTP/2-style multiplexing for TCP/DCTCP runs
+  --tcp-multiplex BOOL      Enable HTTP/2-style multiplexing for TCP/DCTCP runs
                         (default: false)
-  --tcp-http2-sessions N
+  --tcp-multiplex-sessions N
                         Number of HTTP/2-style sessions per server for each
                         TCP client port (default: 1)
   --tcp-pool-size N     Number of pooled TCP connections per server for each
@@ -86,8 +86,8 @@ Optional:
 Environment overrides:
   CLOUDLAB_USER, REMOTE_REPO_DIR, REMOTE_COMPAT_REPO_LINK,
   START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS,
-  TCP_CLIENT_POOLING, TCP_FASTOPEN, TCP_HTTP2,
-  TCP_HTTP2_SESSIONS, TCP_POOL_SIZE,
+  TCP_CLIENT_POOLING, TCP_FASTOPEN, TCP_MULTIPLEX,
+  TCP_MULTIPLEX_SESSIONS, TCP_POOL_SIZE,
   BENCH_LABEL, LOG_PREFIX, RESULTS_SUBDIR, SUMMARY_TITLE
 
 Notes:
@@ -208,12 +208,12 @@ while [[ $# -gt 0 ]]; do
             TCP_FASTOPEN="$2"
             shift 2
             ;;
-        --tcp-http2)
-            TCP_HTTP2="$2"
+        --tcp-multiplex)
+            TCP_MULTIPLEX="$2"
             shift 2
             ;;
-        --tcp-http2-sessions)
-            TCP_HTTP2_SESSIONS="$2"
+        --tcp-multiplex-sessions)
+            TCP_MULTIPLEX_SESSIONS="$2"
             shift 2
             ;;
         --tcp-pool-size)
@@ -438,14 +438,9 @@ rtt_bytes="$4"
 grant_increment="$5"
 max_gso_size="$6"
 tcp_fastopen="$7"
-dctcp="$8"
 tcp_fastopen_sysctl=0
-tcp_ecn_sysctl=0
 if [[ "$tcp_fastopen" == "true" ]]; then
     tcp_fastopen_sysctl=3
-fi
-if [[ "$dctcp" == "true" ]]; then
-    tcp_ecn_sysctl=1
 fi
 for i in $(seq 0 $((num_nodes-1))); do
     rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
@@ -467,8 +462,7 @@ for i in $(seq 0 $((num_nodes-1))); do
             net.homa.rtt_bytes=$rtt_bytes \
             net.homa.grant_increment=$grant_increment \
             net.homa.max_gso_size=$max_gso_size \
-            net.ipv4.tcp_fastopen=$tcp_fastopen_sysctl \
-            net.ipv4.tcp_ecn=$tcp_ecn_sysctl >/dev/null
+            net.ipv4.tcp_fastopen=$tcp_fastopen_sysctl >/dev/null
     "
 done
 EOF
@@ -506,7 +500,7 @@ done
 EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
-CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-fastopen $TCP_FASTOPEN --tcp-http2 $TCP_HTTP2 --tcp-http2-sessions $TCP_HTTP2_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-fastopen $TCP_FASTOPEN --tcp-multiplex $TCP_MULTIPLEX --tcp-multiplex-sessions $TCP_MULTIPLEX_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
 if [[ -n "$WORKLOAD" ]]; then
     CP_VS_TCP_CMD+=" -w $WORKLOAD"
 fi

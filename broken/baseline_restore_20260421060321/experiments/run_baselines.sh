@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REMOTE_USER="${CLOUDLAB_USER:-$(whoami)}"
+NODE0_ALIAS="${NODE0_ALIAS:-node0}"
+REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-~/HomaModule}"
+REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
+START_SCRIPT="${START_SCRIPT:-generic}"
+BENCH_LABEL="${BENCH_LABEL:-Baselines}"
+LOG_PREFIX="${LOG_PREFIX:-baselines}"
+RESULTS_SUBDIR="${RESULTS_SUBDIR:-baseline}"
+SUMMARY_TITLE="${SUMMARY_TITLE:-Baselines Summary}"
+NUM_NODES="${NUM_NODES:-5}"
+RUN_SECONDS="${RUN_SECONDS:-5}"
+SECONDS_MULTIPLIER="${SECONDS_MULTIPLIER:-1}"
+LINK_MBPS="${LINK_MBPS:-25000}"
+HOMA_MAX_NIC_QUEUE_NS="${HOMA_MAX_NIC_QUEUE_NS:-2000}"
+HOMA_RTT_BYTES="${HOMA_RTT_BYTES:-60000}"
+HOMA_GRANT_INCREMENT="${HOMA_GRANT_INCREMENT:-10000}"
+HOMA_MAX_GSO_SIZE="${HOMA_MAX_GSO_SIZE:-20000}"
+CLIENT_MAX="${CLIENT_MAX:-200}"
+# 25G benchmark defaults used by cp_vs_tcp and DCTCP tuning scripts.
+CLIENT_PORTS="${CLIENT_PORTS:-3}"
+PORT_RECEIVERS="${PORT_RECEIVERS:-3}"
+PORT_THREADS="${PORT_THREADS:-3}"
+SERVER_PORTS="${SERVER_PORTS:-3}"
+TCP_CLIENT_PORTS="${TCP_CLIENT_PORTS:-4}"
+TCP_CLIENT_POOLING="${TCP_CLIENT_POOLING:-false}"
+TCP_FASTOPEN="${TCP_FASTOPEN:-false}"
+TCP_MULTIPLEX="${TCP_MULTIPLEX:-false}"
+TCP_MULTIPLEX_SESSIONS="${TCP_MULTIPLEX_SESSIONS:-1}"
+TCP_POOL_SIZE="${TCP_POOL_SIZE:-1}"
+TCP_PORT_RECEIVERS="${TCP_PORT_RECEIVERS:-1}"
+TCP_SERVER_PORTS="${TCP_SERVER_PORTS:-8}"
+TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
+UNSCHED="${UNSCHED:-0}"
+UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
+LOG_ROOT="${LOG_ROOT:-logs}"
+LOCAL_RESULTS_DIR_DEFAULT="$REPO_ROOT/experiments/results"
+LOCAL_RESULTS_DIR="$LOCAL_RESULTS_DIR_DEFAULT"
+RESULTS_RUN_ROOT=""
+WORKLOAD="${WORKLOAD:-}"
+GBPS="${GBPS:-20}"
+TCP="false"
+DCTCP="true"
+SERVER_COUNT="${SERVER_COUNT:-1}"
+LOCAL_LOG_DIR=""
+SUMMARY_MD=""
+
+usage() {
+    cat <<'EOF'
+Usage: run_baselines.sh [options]
+
+Optional:
+  --workload W          Workload for cp_vs_tcp (w1-w5 or a fixed size);
+                        empty means run the built-in workload set
+  --gbps B              Override bandwidth for the workload
+  --servers N           cp_vs_tcp server layout: 0 means all nodes act as
+                        both clients and servers, 1 gives 1 server + 4
+                        clients in the default 5-node setup
+                        (default: 1)
+  --seconds S           Duration of each experiment phase (default: 5)
+  --seconds-multiplier M  Scale the run duration by this factor (default: 1)
+  --tcp BOOL            Run the regular TCP comparison too (default: false)
+  --dctcp BOOL          Run the DCTCP comparison (default: true)
+  --tcp-fastopen BOOL   Enable TCP Fast Open for TCP/DCTCP runs
+                        (default: false)
+  --tcp-multiplex BOOL      Enable HTTP/2-style multiplexing for TCP/DCTCP runs
+                        (default: false)
+  --tcp-multiplex-sessions N
+                        Number of HTTP/2-style sessions per server for each
+                        TCP client port (default: 1)
+  --tcp-pool-size N     Number of pooled TCP connections per server for each
+                        TCP client port (default: 1)
+  --link-mbps M         Homa link rate to configure on each node (default: 25000)
+  --log-root DIR        Parent directory for cp_vs_tcp logs (default: logs)
+  --start-script NAME   Remote module start script, or 'generic'
+                        (default: generic)
+  --local-results-dir D Copy finished results from node0 to this local dir
+                        (default: experiments/results)
+  --num-nodes N         Total nodes in the cluster (default: 5)
+  --node0 HOST          SSH alias for orchestrator node (default: node0)
+
+Environment overrides:
+  CLOUDLAB_USER, REMOTE_REPO_DIR, REMOTE_COMPAT_REPO_LINK,
+  START_SCRIPT, NUM_NODES, RUN_SECONDS, LINK_MBPS, LOG_ROOT, NODE0_ALIAS,
+  TCP_CLIENT_POOLING, TCP_FASTOPEN, TCP_MULTIPLEX,
+  TCP_MULTIPLEX_SESSIONS, TCP_POOL_SIZE,
+  BENCH_LABEL, LOG_PREFIX, RESULTS_SUBDIR, SUMMARY_TITLE
+
+Notes:
+  - Run ssh_setup/ssh_setup.sh first so node aliases and key-based SSH are configured.
+  - By default, this script uses the dedicated-server 5-node cp_vs_tcp layout
+    (`--servers 1`).
+  - Pass `--servers 0` to use the all-nodes layout instead.
+  - The default startup path is 'generic', which discovers the active NIC
+    and applies best-effort Homa setup for nodes that don't match the
+    repo's xl170/m510-specific scripts.
+EOF
+}
+
+log() {
+    printf '\n[%s] %s\n' "$1" "$2"
+}
+
+promote_pdfs() {
+    if [[ -z "$LOCAL_RUN_DIR" ]]; then
+        return
+    fi
+    if [[ -z "$LOCAL_LOG_DIR" || ! -d "$LOCAL_LOG_DIR" ]]; then
+        return
+    fi
+    while IFS= read -r -d '' pdf; do
+        case "$(basename "$pdf")" in
+            vs_*.pdf|*_p50.pdf|*_p99.pdf|short_cdf_*.pdf)
+                mv "$pdf" "$LOCAL_RUN_DIR/"
+                ;;
+            *)
+                rm -f "$pdf"
+                ;;
+        esac
+    done < <(find "$LOCAL_LOG_DIR" -type f -name '*.pdf' -print0)
+    find "$LOCAL_LOG_DIR" -type d -empty -delete
+}
+
+generate_summary_if_possible() {
+    SUMMARY_MD="$LOCAL_RUN_DIR/summary.md"
+    if [[ -d "$LOCAL_LOG_DIR" ]] && find "$LOCAL_LOG_DIR" -type f -print -quit | grep -q .; then
+        log report "Generating saved summary table at $SUMMARY_MD"
+        python3 "$REPO_ROOT/experiments/generate_dctcp_tuning_summary.py" \
+            "$LOCAL_RUN_DIR" \
+            --output "$SUMMARY_MD" \
+            --title "$SUMMARY_TITLE" || true
+    else
+        log warn "Skipping summary generation because no result artifacts were fetched"
+    fi
+}
+
+on_error() {
+    local exit_code="$1"
+    log warn "$BENCH_LABEL run failed; fetching any partial results to $LOCAL_RUN_DIR"
+    mkdir -p "$LOCAL_LOG_DIR"
+    rsync -e "ssh -o StrictHostKeyChecking=no" -rt \
+        "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/" \
+        >/dev/null 2>&1 || true
+    promote_pdfs
+    ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest" 2>/dev/null || true
+    generate_summary_if_possible
+    exit "$exit_code"
+}
+
+shell_quote() {
+    printf "%q" "$1"
+}
+
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Missing required command: $1" >&2
+        exit 1
+    fi
+}
+
+normalize_workload() {
+    local workload="$1"
+    case "${workload,,}" in
+        w[1-5])
+            printf '%s' "${workload,,}"
+            ;;
+        *)
+            printf '%s' "$workload"
+            ;;
+    esac
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workload)
+            WORKLOAD="$2"
+            shift 2
+            ;;
+        --gbps)
+            GBPS="$2"
+            shift 2
+            ;;
+        --servers)
+            SERVER_COUNT="$2"
+            shift 2
+            ;;
+        --seconds)
+            RUN_SECONDS="$2"
+            shift 2
+            ;;
+        --seconds-multiplier)
+            SECONDS_MULTIPLIER="$2"
+            shift 2
+            ;;
+        --tcp)
+            TCP="$2"
+            shift 2
+            ;;
+        --dctcp)
+            DCTCP="$2"
+            shift 2
+            ;;
+        --tcp-fastopen)
+            TCP_FASTOPEN="$2"
+            shift 2
+            ;;
+        --tcp-multiplex)
+            TCP_MULTIPLEX="$2"
+            shift 2
+            ;;
+        --tcp-multiplex-sessions)
+            TCP_MULTIPLEX_SESSIONS="$2"
+            shift 2
+            ;;
+        --tcp-pool-size)
+            TCP_POOL_SIZE="$2"
+            shift 2
+            ;;
+        --link-mbps)
+            LINK_MBPS="$2"
+            shift 2
+            ;;
+        --log-root)
+            LOG_ROOT="$2"
+            shift 2
+            ;;
+        --local-results-dir)
+            LOCAL_RESULTS_DIR="$2"
+            shift 2
+            ;;
+        --start-script)
+            START_SCRIPT="$2"
+            shift 2
+            ;;
+        --num-nodes)
+            NUM_NODES="$2"
+            shift 2
+            ;;
+        --node0)
+            NODE0_ALIAS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -n "$WORKLOAD" ]]; then
+    WORKLOAD="$(normalize_workload "$WORKLOAD")"
+fi
+
+if (( NUM_NODES < 2 )); then
+    echo "--num-nodes must be at least 2" >&2
+    exit 1
+fi
+
+if (( SERVER_COUNT < 0 || SERVER_COUNT >= NUM_NODES )); then
+    echo "--servers must be between 0 and $((NUM_NODES-1))" >&2
+    exit 1
+fi
+
+require_cmd ssh
+require_cmd rsync
+require_cmd date
+
+STAMP="$(date +%Y%m%d%H%M%S)"
+TOPOLOGY_TAG="allnodes"
+if (( SERVER_COUNT > 0 )); then
+    TOPOLOGY_TAG="servers${SERVER_COUNT}"
+fi
+WORKLOAD_TAG="${WORKLOAD:-allworkloads}"
+LOG_DIR="$LOG_ROOT/${LOG_PREFIX}_${TOPOLOGY_TAG}_${WORKLOAD_TAG}_${STAMP}"
+RESULTS_RUN_ROOT="$LOCAL_RESULTS_DIR/$RESULTS_SUBDIR"
+LOCAL_RUN_DIR="$RESULTS_RUN_ROOT/$(basename "$LOG_DIR")"
+LOCAL_LOG_DIR="$LOCAL_RUN_DIR/logs"
+mkdir -p "$RESULTS_RUN_ROOT"
+trap 'on_error $?' ERR
+log sync "Pushing updated cp_vs_tcp sources to $NODE0_ALIAS"
+rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
+    "$REPO_ROOT/util/cp_vs_tcp" \
+    "$REPO_ROOT/util/cperf.py" \
+    "$REPO_ROOT/util/cp_node.cc" \
+    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/"
+
+ssh "$NODE0_ALIAS" "chmod 755 $REMOTE_REPO_DIR/util/cp_vs_tcp"
+
+log setup "Preparing node0 build and runtime environment on $NODE0_ALIAS"
+ssh "$NODE0_ALIAS" "
+    set -euo pipefail
+    if [[ ! -d $REMOTE_REPO_DIR/.git ]]; then
+        echo 'Remote repo not found at $REMOTE_REPO_DIR' >&2
+        exit 1
+    fi
+    ln -sfn $REMOTE_REPO_DIR $REMOTE_COMPAT_REPO_LINK
+    mkdir -p ~/bin ~/.ssh
+    chmod 700 ~/.ssh
+    if [[ ! -f ~/.ssh/id_ed25519 ]]; then
+        ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ''
+    fi
+    grep -qxF \"\$(cat ~/.ssh/id_ed25519.pub)\" ~/.ssh/authorized_keys 2>/dev/null || \
+        cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+    sudo apt-get update
+    sudo apt-get install -y python3 python3-numpy python3-matplotlib rsync
+    cd $REMOTE_REPO_DIR
+    make -j
+    make -C util -j
+    cp cloudlab/bin/* ~/bin/
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/homa.ko ~/bin/homa.ko
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/cp_node ~/bin/cp_node
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/homa_prio ~/bin/homa_prio
+    /usr/bin/install -m 755 $REMOTE_REPO_DIR/util/*.py ~/bin/
+    chmod +x ~/bin/*
+    cp cloudlab/bashrc ~/.bashrc
+    cp cloudlab/bash_profile ~/.bash_profile
+"
+
+log setup "Authorizing node0 SSH key on node1 through node$((NUM_NODES-1))"
+NODE0_PUBKEY="$(ssh "$NODE0_ALIAS" "cat ~/.ssh/id_ed25519.pub")"
+for i in $(seq 1 $((NUM_NODES-1))); do
+    ssh "node$i" "
+        set -euo pipefail
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        grep -qxF '$NODE0_PUBKEY' ~/.ssh/authorized_keys 2>/dev/null || \
+            printf '%s\n' '$NODE0_PUBKEY' >> ~/.ssh/authorized_keys
+    "
+done
+
+log setup "Copying runtime files to node-0 through node-$((NUM_NODES-1)) and loading Homa with $START_SCRIPT"
+ssh "$NODE0_ALIAS" bash -s -- "$REMOTE_REPO_DIR" "$START_SCRIPT" "$NUM_NODES" \
+    "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" "$HOMA_RTT_BYTES" \
+    "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" <<'EOF'
+set -euo pipefail
+remote_repo_dir="$1"
+start_script="$2"
+num_nodes="$3"
+link_mbps_override="$4"
+max_nic_queue_ns_override="$5"
+rtt_bytes_override="$6"
+grant_increment_override="$7"
+max_gso_size_override="$8"
+node0_pubkey="$(cat ~/.ssh/id_ed25519.pub)"
+private_ip_pattern='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
+
+cd "$remote_repo_dir"
+rm -f /tmp/homa_node_hosts
+for i in $(seq 0 $((num_nodes-1))); do
+    node="node-$i"
+    private_ip="$(ssh "$node" "hostname -I | tr ' ' '\n' | grep -E '$private_ip_pattern' | head -n1")"
+    if [[ -z "$private_ip" ]]; then
+        echo "Couldn't determine private IPv4 address for $node" >&2
+        exit 1
+    fi
+    printf '%s node-%d node%d\n' "$private_ip" "$i" "$i" >> /tmp/homa_node_hosts
+done
+
+for i in $(seq 0 $((num_nodes-1))); do
+    node="node-$i"
+    echo "=== $node ==="
+    ssh "$node" "mkdir -p ~/bin ~/.ssh"
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv ~/.bashrc ~/.bash_profile "$node:"
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv ~/bin/ "$node:~/bin/"
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
+        homa.ko util/cp_node util/homa_prio util/*.py "$node:~/bin/"
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv /tmp/homa_node_hosts "$node:/tmp/homa_node_hosts"
+    ssh "$node" "sudo /usr/bin/install -m 755 ~/bin/cp_node /usr/bin/cp_node && sudo /usr/bin/install -m 755 ~/bin/homa_prio /usr/bin/homa_prio && sudo /usr/bin/install -m 755 ~/bin/*.py /usr/bin/"
+    ssh "$node" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qxF '$node0_pubkey' ~/.ssh/authorized_keys 2>/dev/null || printf '%s\n' '$node0_pubkey' >> ~/.ssh/authorized_keys"
+    ssh "$node" "sudo sed -i '/ node-[0-9]\\b/d;/ node[0-9]\\b/d' /etc/hosts && cat /tmp/homa_node_hosts | sudo tee -a /etc/hosts >/dev/null"
+    if [[ "$start_script" == "generic" ]]; then
+        ssh "$node" bash -s -- "$link_mbps_override" "$max_nic_queue_ns_override" \
+            "$rtt_bytes_override" "$grant_increment_override" \
+            "$max_gso_size_override" <<'INNER'
+set -eu
+link_mbps="$1"
+max_nic_queue_ns="$2"
+rtt_bytes="$3"
+grant_increment="$4"
+max_gso_size="$5"
+iface=$(ip -o -4 addr show scope global | awk '$4 ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/ {print $2; exit}')
+if [[ -z "$iface" ]]; then
+    echo "Couldn't determine private interface for Homa setup" >&2
+    exit 1
+fi
+sudo rmmod homa >/dev/null 2>&1 || true
+sudo insmod ~/bin/homa.ko
+sudo sysctl -w net.homa.link_mbps="$link_mbps"
+sudo sysctl -w net.homa.max_nic_queue_ns="$max_nic_queue_ns"
+sudo sysctl -w net.homa.rtt_bytes="$rtt_bytes"
+sudo sysctl -w net.homa.grant_increment="$grant_increment"
+sudo sysctl -w net.homa.max_gso_size="$max_gso_size"
+if command -v cpupower >/dev/null 2>&1; then
+    sudo cpupower frequency-set -g performance >/dev/null 2>&1 || true
+fi
+rm -f ~/.homa_metrics
+sudo sysctl -w net.core.rps_sock_flow_entries=32768
+if command -v ethtool >/dev/null 2>&1 && [[ -n "$iface" ]]; then
+    sudo ethtool -C "$iface" adaptive-rx off rx-usecs 0 rx-frames 1 >/dev/null 2>&1 || true
+    for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+        [[ -e "$f" ]] || continue
+        printf '2048\n' | sudo tee "$f" >/dev/null || true
+    done
+    for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+        [[ -e "$f" ]] || continue
+        printf 'ffff\n' | sudo tee "$f" >/dev/null || true
+    done
+    sudo ethtool -K "$iface" ntuple on >/dev/null 2>&1 || true
+fi
+INNER
+    else
+        ssh "$node" "$start_script ~/bin/homa.ko"
+    fi
+done
+EOF
+
+log setup "Refreshing Homa runtime on node-0 through node-$((NUM_NODES-1)) before $BENCH_LABEL"
+ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" "$LINK_MBPS" "$HOMA_MAX_NIC_QUEUE_NS" \
+    "$HOMA_RTT_BYTES" "$HOMA_GRANT_INCREMENT" "$HOMA_MAX_GSO_SIZE" \
+    "$TCP_FASTOPEN" "$DCTCP" <<'EOF'
+set -euo pipefail
+num_nodes="$1"
+link_mbps="$2"
+max_nic_queue_ns="$3"
+rtt_bytes="$4"
+grant_increment="$5"
+max_gso_size="$6"
+tcp_fastopen="$7"
+dctcp="$8"
+tcp_fastopen_sysctl=0
+tcp_ecn_sysctl=0
+if [[ "$tcp_fastopen" == "true" ]]; then
+    tcp_fastopen_sysctl=3
+fi
+if [[ "$dctcp" == "true" ]]; then
+    tcp_ecn_sysctl=1
+fi
+for i in $(seq 0 $((num_nodes-1))); do
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
+        ~/bin/homa.ko ~/bin/cp_node ~/bin/homa_prio ~/bin/*.py "node-$i:~/bin/"
+    rsync -e 'ssh -o StrictHostKeyChecking=no' -rtv \
+        /tmp/homa_node_hosts "node-$i:/tmp/homa_node_hosts"
+    ssh "node-$i" "
+        sudo pkill cp_node >/dev/null 2>&1 || true
+        sudo pkill homa_prio >/dev/null 2>&1 || true
+        sudo rmmod homa >/dev/null 2>&1 || true
+        sudo sed -i '/ node-[0-9]\\b/d;/ node[0-9]\\b/d' /etc/hosts
+        cat /tmp/homa_node_hosts | sudo tee -a /etc/hosts >/dev/null
+        sudo insmod ~/bin/homa.ko
+        sudo /usr/bin/install -m 755 ~/bin/cp_node /usr/bin/cp_node
+        sudo /usr/bin/install -m 755 ~/bin/homa_prio /usr/bin/homa_prio
+        sudo /usr/bin/install -m 755 ~/bin/*.py /usr/bin/
+        sudo sysctl -w net.homa.link_mbps=$link_mbps \
+            net.homa.max_nic_queue_ns=$max_nic_queue_ns \
+            net.homa.rtt_bytes=$rtt_bytes \
+            net.homa.grant_increment=$grant_increment \
+            net.homa.max_gso_size=$max_gso_size \
+            net.ipv4.tcp_fastopen=$tcp_fastopen_sysctl \
+            net.ipv4.tcp_ecn=$tcp_ecn_sysctl >/dev/null
+    "
+done
+EOF
+
+log setup "Validating private-network connectivity for node-0 through node-$((NUM_NODES-1))"
+ssh "$NODE0_ALIAS" bash -s -- "$NUM_NODES" <<'EOF'
+set -euo pipefail
+num_nodes="$1"
+private_ip_pattern='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
+for i in $(seq 0 $((num_nodes-1))); do
+    node="node-$i"
+    ssh "$node" "bash -s -- $(printf '%q' "$node") $(printf '%q' "$private_ip_pattern")" <<'INNER'
+set -euo pipefail
+node_name="$1"
+private_ip_pattern="$2"
+iface="$(ip -o -4 addr show scope global | awk -v pattern="$private_ip_pattern" '$4 ~ pattern {print $2; exit}')"
+if [[ -z "$iface" ]]; then
+    echo "$node_name: couldn't determine private interface" >&2
+    exit 1
+fi
+carrier="$(cat /sys/class/net/"$iface"/carrier 2>/dev/null || echo 0)"
+operstate="$(cat /sys/class/net/"$iface"/operstate 2>/dev/null || echo unknown)"
+if [[ "$carrier" != "1" ]]; then
+    echo "$node_name: private interface $iface has no carrier (operstate=$operstate)" >&2
+    exit 1
+fi
+if [[ "$node_name" != "node-0" ]]; then
+    ping -c 1 -W 1 node-0 >/dev/null
+fi
+INNER
+    if [[ "$node" != "node-0" ]]; then
+        ping -c 1 -W 1 "$node" >/dev/null
+    fi
+done
+EOF
+
+EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
+CP_VS_TCP_CMD="./cp_vs_tcp -n $NUM_NODES --servers $SERVER_COUNT --tcp $TCP --dctcp $DCTCP -s $EFFECTIVE_SECONDS -l $LOG_DIR -b $GBPS --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-client-pooling $TCP_CLIENT_POOLING --tcp-fastopen $TCP_FASTOPEN --tcp-multiplex $TCP_MULTIPLEX --tcp-multiplex-sessions $TCP_MULTIPLEX_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+if [[ -n "$WORKLOAD" ]]; then
+    CP_VS_TCP_CMD+=" -w $WORKLOAD"
+fi
+
+log run "Launching cp_vs_tcp ($BENCH_LABEL) on $NODE0_ALIAS with --servers $SERVER_COUNT"
+ssh "$NODE0_ALIAS" "bash -lc 'cd $REMOTE_REPO_DIR/util && $CP_VS_TCP_CMD'"
+
+log fetch "Copying results back to $LOCAL_RUN_DIR"
+mkdir -p "$LOCAL_LOG_DIR"
+rsync -e "ssh -o StrictHostKeyChecking=no" -rtv \
+    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/$LOG_DIR/" "$LOCAL_LOG_DIR/"
+promote_pdfs
+ln -sfn "$(basename "$LOCAL_RUN_DIR")" "$RESULTS_RUN_ROOT/latest"
+generate_summary_if_possible
+
+if [[ -f "$SUMMARY_MD" ]]; then
+    log summary "Saved summary table"
+    sed -n '/^## /,$p' "$SUMMARY_MD"
+fi
+
+log done "$BENCH_LABEL complete. Remote results are under $REMOTE_REPO_DIR/util/$LOG_DIR on $NODE0_ALIAS and local copies are under $LOCAL_RUN_DIR"
