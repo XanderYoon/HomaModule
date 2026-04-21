@@ -170,6 +170,12 @@ LOCAL_LOG_DIR="$LOCAL_RUN_DIR/logs"
 mkdir -p "$RESULTS_RUN_ROOT"
 trap 'on_error $?' ERR
 
+log setup "Syncing cp_dctcp_final_basic to $NODE0_ALIAS"
+rsync -e "ssh -o StrictHostKeyChecking=no" -rt \
+    "$REPO_ROOT/util/cp_dctcp_final_basic" \
+    "$NODE0_ALIAS:$REMOTE_REPO_DIR/util/"
+ssh "$NODE0_ALIAS" "chmod +x $REMOTE_REPO_DIR/util/cp_dctcp_final_basic"
+
 log setup "Checking node0 runtime prerequisites on $NODE0_ALIAS"
 ssh "$NODE0_ALIAS" "
     set -euo pipefail
