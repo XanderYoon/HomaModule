@@ -40,6 +40,7 @@ TCP_PORT_THREADS="${TCP_PORT_THREADS:-1}"
 SAMPLES="${SAMPLES:-5}"
 SAMPLE_COOLDOWN="${SAMPLE_COOLDOWN:-5}"
 VARIANT_COOLDOWN="${VARIANT_COOLDOWN:-5}"
+DCTCP_NETEM_LOSS="${DCTCP_NETEM_LOSS:-0.5%}"
 UNSCHED="${UNSCHED:-0}"
 UNSCHED_BOOST="${UNSCHED_BOOST:-0.0}"
 LOG_ROOT="${LOG_ROOT:-logs}"
@@ -84,6 +85,9 @@ Optional:
                         (default: 5)
   --variant-cooldown S  Seconds to wait between variants
                         (default: 5)
+  --dctcp-netem-loss X  Optional tc netem loss applied during DCTCP/TCP
+                        variant runs, such as 0.1% or 0.5%
+                        (default: 0.5%)
   --unsched N           Preserve run_baselines CLI compatibility
   --unsched-boost F     Preserve run_baselines CLI compatibility
   --log-root DIR        Parent directory for benchmark logs (default: logs)
@@ -257,6 +261,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --variant-cooldown)
             VARIANT_COOLDOWN="$2"
+            shift 2
+            ;;
+        --dctcp-netem-loss)
+            DCTCP_NETEM_LOSS="$2"
             shift 2
             ;;
         --unsched)
@@ -494,6 +502,9 @@ EOF
 
 EFFECTIVE_SECONDS=$(awk "BEGIN { s = int($RUN_SECONDS * $SECONDS_MULTIPLIER); print (s < 1 ? 1 : s) }")
 CP_CMD="./$BENCH_SCRIPT -n $NUM_NODES --servers $SERVER_COUNT -b $GBPS -s $EFFECTIVE_SECONDS --samples $SAMPLES --sample-cooldown $SAMPLE_COOLDOWN --variant-cooldown $VARIANT_COOLDOWN -l $LOG_DIR --client-max $CLIENT_MAX --client-ports $CLIENT_PORTS --port-receivers $PORT_RECEIVERS --port-threads $PORT_THREADS --server-ports $SERVER_PORTS --tcp-client-ports $TCP_CLIENT_PORTS --tcp-multiplex-sessions $TCP_MULTIPLEX_SESSIONS --tcp-pool-size $TCP_POOL_SIZE --tcp-port-receivers $TCP_PORT_RECEIVERS --tcp-server-ports $TCP_SERVER_PORTS --tcp-port-threads $TCP_PORT_THREADS --unsched $UNSCHED --unsched-boost $UNSCHED_BOOST"
+if [[ -n "$DCTCP_NETEM_LOSS" ]]; then
+    CP_CMD+=" --dctcp-netem-loss $DCTCP_NETEM_LOSS"
+fi
 if [[ -n "$VARIANT_FLAG" ]]; then
     CP_CMD+=" $VARIANT_FLAG $VARIANT_VALUE"
 fi

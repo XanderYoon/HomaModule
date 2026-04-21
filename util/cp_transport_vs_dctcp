@@ -124,6 +124,9 @@ parser.add_argument('--seconds-multiplier', dest='seconds_multiplier',
         type=float, metavar='M', default=1.0,
         help="Scale the run duration for all variants by this factor "
         "(default: 1.0)")
+parser.add_argument('--dctcp-netem-loss', dest='dctcp_netem_loss',
+        default="", help="Optional tc netem loss to apply during DCTCP/TCP "
+        "variant runs, such as '0.5%%' (default: none)")
 options = parser.parse_args()
 init(options)
 if options.num_servers <= 0:
@@ -150,6 +153,7 @@ tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
 benchmark_error = None
 
 if not options.plot_only:
+    tcp_nodes = sorted(set(list(servers) + list(clients)))
     for workload, bw in load_info:
         options.workload = workload
         options.gbps = bw * bw_multiplier
@@ -177,10 +181,16 @@ if not options.plot_only:
                 tcp_options.protocol = "tcp"
                 configure_variant_environment(tcp_options, variant,
                         range(0, options.num_nodes))
+                if options.dctcp_netem_loss != "":
+                    set_netem_loss(tcp_nodes, options.dctcp_netem_loss)
                 start_servers(servers, tcp_options)
                 run_experiment("%s_%s" % (variant["name"], workload),
                         clients, tcp_options)
+                if options.dctcp_netem_loss != "":
+                    clear_netem_loss(tcp_nodes)
         except Exception:
+            if options.dctcp_netem_loss != "":
+                clear_netem_loss(tcp_nodes)
             if benchmark_error is None:
                 benchmark_error = sys.exc_info()
             log(traceback.format_exc())

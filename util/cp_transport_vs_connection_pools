@@ -95,6 +95,9 @@ parser.add_argument('--pool-sizes', dest='pool_sizes', metavar='counts',
         default="2,4,8",
         help="Comma-separated pooled TCP connection counts to compare "
         "(default: 2,4,8)")
+parser.add_argument('--dctcp-netem-loss', dest='dctcp_netem_loss',
+        default="", help="Optional tc netem loss to apply during DCTCP/TCP "
+        "variant runs, such as '0.5%%' (default: none)")
 options = parser.parse_args()
 pool_sizes = parse_pool_sizes(options.pool_sizes)
 VARIANTS = make_variants(pool_sizes)
@@ -127,6 +130,7 @@ tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
 tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
 
 if not options.plot_only:
+    tcp_nodes = sorted(set(list(servers) + list(clients)))
     for workload, bw in load_info:
         options.workload = workload
         options.gbps = bw * bw_multiplier
@@ -154,6 +158,8 @@ if not options.plot_only:
                 tcp_options.protocol = "tcp"
                 configure_variant_environment(tcp_options,
                         range(0, options.num_nodes))
+                if options.dctcp_netem_loss != "":
+                    set_netem_loss(tcp_nodes, options.dctcp_netem_loss)
                 start_servers(servers, tcp_options)
                 for sample in range(options.samples):
                     log("Running %s sample %d/%d for %s" % (
@@ -167,9 +173,13 @@ if not options.plot_only:
                                 options.samples))
                         time.sleep(options.sample_cooldown)
                 checkpoint("variant saved %s_%s" % (variant["name"], workload))
+                if options.dctcp_netem_loss != "":
+                    clear_netem_loss(tcp_nodes)
                 if variant != VARIANTS[-1]:
                     time.sleep(options.variant_cooldown)
         except Exception as e:
+            if options.dctcp_netem_loss != "":
+                clear_netem_loss(tcp_nodes)
             log(traceback.format_exc())
 
     set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
