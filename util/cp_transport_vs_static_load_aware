@@ -1,0 +1,250 @@
+#!/usr/bin/python3
+
+from cperf import *
+
+DEFAULTS_25G = {
+    "client_ports":        3,
+    "port_receivers":      3,
+    "port_threads":        3,
+    "server_ports":        3,
+    "tcp_client_ports":    4,
+    "tcp_port_receivers":  1,
+    "tcp_port_threads":    1,
+    "tcp_server_ports":    8,
+}
+
+load_info = [["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
+
+def parse_offset_us(value):
+    try:
+        offset_us = int(value)
+    except ValueError:
+        raise Error("Illegal value for --offset-us: %s" % (value))
+    if offset_us < 0:
+        raise Error("--offset-us must be non-negative: %s" % (value))
+    return offset_us
+
+def make_variants(offset_us):
+    return [
+        {
+            "name": "dctcp",
+            "label": "DCTCP",
+            "tcp_fastopen": False,
+            "tcp_client_pooling": False,
+            "tcp_multiplex": False,
+            "tcp_multiplex_sessions": 1,
+            "tcp_pool_size": 1,
+            "tcp_load_aware": False,
+            "tcp_stagger_us": 0,
+            "color99": dctcp_color,
+            "color50": dctcp_color2,
+        },
+        {
+            "name": "dctcp_static_load_aware",
+            "label": "DCTCP + Static Scheduler + Load-Aware (%d us)" % (
+                    offset_us),
+            "tcp_fastopen": False,
+            "tcp_client_pooling": False,
+            "tcp_multiplex": False,
+            "tcp_multiplex_sessions": 1,
+            "tcp_pool_size": 1,
+            "tcp_load_aware": True,
+            "tcp_stagger_us": offset_us,
+            "color99": pyplot_colors[4],
+            "color50": pyplot_colors[6],
+        },
+    ]
+
+def apply_variant_options(options, variant):
+    configured = copy.deepcopy(options)
+    for key, value in variant.items():
+        if key in ("name", "label", "color99", "color50"):
+            continue
+        setattr(configured, key, value)
+    return configured
+
+def save_plot_with_side_legend(ax, path, legend_y=1.0):
+    fig = ax.figure
+    legend = ax.legend(loc="upper left", bbox_to_anchor=(1.02, legend_y),
+            borderaxespad=0.0, prop={'size': 9})
+    fig.set_size_inches(12, 5)
+    fig.tight_layout(rect=(0, 0, 0.93, 1))
+    fig.savefig(path, bbox_inches="tight",
+            bbox_extra_artists=[legend] if legend else None)
+
+def configure_variant_environment(options, all_nodes):
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", "dctcp",
+            all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_ecn", "1", all_nodes)
+    set_sysctl_parameter("net.ipv4.tcp_fastopen",
+            "3" if getattr(options, "tcp_fastopen", False) else "0",
+            all_nodes)
+
+parser = get_parser(description=
+        'Measures slowdown as a function of message size for baseline DCTCP '
+        'and baseline DCTCP with only application-layer static scheduling '
+        'and load-aware balancing enabled.',
+        usage='%(prog)s [options]')
+parser.set_defaults(**DEFAULTS_25G)
+parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
+        default=0, help="If nonzero, clients and servers will be segregated "
+        "and this value indicates the number of server nodes; all other "
+        "nodes will be clients. If 0, each node runs both a client and a "
+        "server (default: 0)")
+parser.add_argument('--offset-us', dest='offset_us', metavar='offset',
+        default="5",
+        help="Static scheduler offset in microseconds for the combined "
+        "static+load-aware variant (default: 5)")
+parser.add_argument('--dctcp-netem-loss', dest='dctcp_netem_loss',
+        default="", help="Optional tc netem loss to apply during DCTCP/TCP "
+        "variant runs, such as '0.5%%' (default: none)")
+options = parser.parse_args()
+offset_us = parse_offset_us(options.offset_us)
+VARIANTS = make_variants(offset_us)
+init(options)
+if options.num_servers <= 0:
+    servers = range(0, options.num_nodes)
+    clients = range(0, options.num_nodes)
+    options.num_clients = options.num_nodes
+    options.num_servers = options.num_nodes
+    bw_multiplier = 0.5
+else:
+    if options.num_servers >= options.num_nodes:
+        raise Error("Illegal value %d for --servers option; must be less "
+                "than --nodes (%d)" % (options.num_servers, options.num_nodes))
+    options.num_clients = options.num_nodes - options.num_servers
+    servers = range(0, options.num_servers)
+    clients = range(options.num_servers, options.num_nodes)
+    options.server_ports = options.server_ports * 2
+    options.client_ports = options.client_ports * 2
+    options.tcp_server_ports = options.tcp_server_ports * 2
+    options.tcp_client_ports = options.tcp_client_ports * 2
+    bw_multiplier = min(options.num_servers, options.num_clients) \
+            / options.num_clients
+
+if options.workload != "":
+    load_info = [[options.workload, options.gbps]]
+
+congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
+tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
+tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
+
+if not options.plot_only:
+    tcp_nodes = sorted(set(list(servers) + list(clients)))
+    for workload, bw in load_info:
+        options.workload = workload
+        options.gbps = bw * bw_multiplier
+        unloaded_exp = "unloaded_" + workload
+        homa_exp = "homa_" + workload
+        try:
+            options.protocol = "homa"
+            start_servers(range(1, 2), options)
+
+            o = copy.deepcopy(options)
+            o.gbps = 0.0
+            o.client_ports = 1
+            o.client_max = 1
+            o.server_ports = 1
+            o.server_nodes = 1
+            o.first_server = 1
+            o.unloaded = 500
+            run_experiment(unloaded_exp, range(0, 1), o)
+
+            start_servers(servers, options)
+            run_experiment(homa_exp, clients, options)
+
+            for variant in VARIANTS:
+                tcp_options = apply_variant_options(options, variant)
+                tcp_options.protocol = "tcp"
+                configure_variant_environment(tcp_options,
+                        range(0, options.num_nodes))
+                if options.dctcp_netem_loss != "":
+                    set_netem_loss(tcp_nodes, options.dctcp_netem_loss)
+                start_servers(servers, tcp_options)
+                for sample in range(options.samples):
+                    log("Running %s sample %d/%d for %s" % (
+                            variant["name"], sample + 1, options.samples,
+                            workload))
+                    run_experiment("%s_%s" % (variant["name"], workload),
+                            clients, tcp_options)
+                    if sample != (options.samples - 1):
+                        checkpoint("sample saved %s_%s sample %d/%d"
+                                % (variant["name"], workload, sample + 1,
+                                options.samples))
+                        time.sleep(options.sample_cooldown)
+                checkpoint("variant saved %s_%s" % (variant["name"], workload))
+                if options.dctcp_netem_loss != "":
+                    clear_netem_loss(tcp_nodes)
+                if variant != VARIANTS[-1]:
+                    time.sleep(options.variant_cooldown)
+        except Exception as e:
+            if options.dctcp_netem_loss != "":
+                clear_netem_loss(tcp_nodes)
+            log(traceback.format_exc())
+
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
+            range(0, options.num_nodes))
+    log("Stopping nodes")
+    stop_nodes()
+    scan_logs()
+
+for workload, bw in load_info:
+    unloaded_exp = "unloaded_" + workload
+    homa_exp = "homa_" + workload
+    first_exp = "%s_%s" % (VARIANTS[0]["name"], workload)
+    try:
+        set_unloaded(unloaded_exp)
+    except Exception as e:
+        log("Skipping %s plots: %s" % (workload, str(e)))
+        continue
+
+    log("Generating slowdown plot for %s" % (workload))
+    title = "%s %d nodes, %.1f Gbps" % (workload.capitalize(),
+            options.num_nodes, bw)
+    ax = start_slowdown_plot(title, 10000, first_exp)
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        plot_slowdown(ax, exp, "p99", "%s P99" % (variant["label"]),
+                color=variant["color99"])
+        plot_slowdown(ax, exp, "p50", "%s P50" % (variant["label"]),
+                color=variant["color50"])
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_static_load_aware_tuning_%s.pdf" % (
+            options.log_dir, workload))
+
+    log("Generating P50 slowdown plot for %s" % (workload))
+    ax = start_slowdown_plot(title + " P50", 10000, first_exp)
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        plot_slowdown(ax, exp, "p50", "%s P50" % (variant["label"]),
+                color=variant["color50"])
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_static_load_aware_tuning_%s_p50.pdf" % (
+            options.log_dir, workload))
+
+    log("Generating P99 slowdown plot for %s" % (workload))
+    ax = start_slowdown_plot(title + " P99", P99_SLOWDOWN_MAX, first_exp)
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        plot_slowdown(ax, exp, "p99", "%s P99" % (variant["label"]),
+                color=variant["color99"])
+    save_plot_with_side_legend(ax,
+            "%s/reports/vs_static_load_aware_tuning_%s_p99.pdf" % (
+            options.log_dir, workload))
+
+    log("Generating short message CDF for %s" % (workload))
+    homa_x, homa_y = get_short_cdf(homa_exp)
+    start_cdf_plot(title, 10, 0.99e05, 1e-05, "RTT (usecs)",
+            "Cumulative Fraction Short Messages")
+    for variant in VARIANTS:
+        exp = "%s_%s" % (variant["name"], workload)
+        x, y = get_short_cdf(exp)
+        plt.plot(x, y, label=variant["label"], color=variant["color99"])
+    plt.plot(homa_x, homa_y, label="Homa", color=homa_color)
+    save_plot_with_side_legend(plt.gca(),
+            "%s/reports/short_cdf_%s.pdf" % (options.log_dir, workload),
+            legend_y=0.88)
