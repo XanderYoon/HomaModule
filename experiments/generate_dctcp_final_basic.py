@@ -15,8 +15,8 @@ PROTOCOLS = [
         "prefix": "dctcp",
     },
     {
-        "protocol": "DCTCP + Static + Load-Aware",
-        "prefix": "dctcp_static_load_aware",
+        "protocol": "DCTCP + Static Scheduler",
+        "prefix": "dctcp_static",
     },
 ]
 
@@ -199,8 +199,8 @@ def build_caption(num_nodes):
     return (
         "cp_basic-style summary for the final Homa vs DCTCP comparison on the "
         "%s. The rows report averages of the per-second samples recorded during "
-        "the timed portion of each experiment. The combined DCTCP variant uses "
-        "application-layer static scheduling plus load-aware balancing, with no "
+        "the timed portion of each experiment. The modified DCTCP variant uses "
+        "application-layer static scheduling only, with no load-aware balancing, "
         "TFO, connection pooling, or multiplexing."
     ) % (topology)
 
@@ -261,7 +261,7 @@ def main():
         "- Each table entry is the average of the per-second samples recorded during the timed experiment window.",
         "- RPC rates are shown in `Mops/sec`, converted from `Kops/sec`.",
         "",
-        "| Metric | Homa | DCTCP | DCTCP + Static + Load-Aware |",
+        "| Metric | Homa | DCTCP | DCTCP + Static Scheduler |",
         "|---|---:|---:|---:|",
     ]
 
@@ -272,7 +272,7 @@ def main():
                 metric,
                 row["Homa"],
                 row["DCTCP"],
-                row["DCTCP + Static + Load-Aware"],
+                row["DCTCP + Static Scheduler"],
             )
         )
 

@@ -54,15 +54,15 @@ def parse_offset_us(value):
 def get_variants(offset_us):
     variants = copy.deepcopy(VARIANTS)
     variants.append({
-        "name": "dctcp_static_load_aware",
-        "label": "DCTCP + Static Scheduler + Load-Aware (%d us)" % (
+        "name": "dctcp_static",
+        "label": "DCTCP + Static Scheduler (%d us)" % (
                 offset_us),
         "tcp_fastopen": False,
         "tcp_client_pooling": False,
         "tcp_multiplex": False,
         "tcp_multiplex_sessions": 1,
         "tcp_pool_size": 1,
-        "tcp_load_aware": True,
+        "tcp_load_aware": False,
         "tcp_stagger_us": offset_us,
     })
     return variants
@@ -174,8 +174,7 @@ def run_tcp_suite(options, variant):
 
 parser = get_parser(description=
         'Measures cp_basic-style latency and throughput for Homa, baseline '
-        'DCTCP, and DCTCP with application-layer static scheduling plus '
-        'load-aware balancing.',
+        'DCTCP, and DCTCP with application-layer static scheduling.',
         usage='%(prog)s [options]',
         defaults={
             "client_ports":     9,
@@ -187,7 +186,7 @@ parser = get_parser(description=
 parser.add_argument('--offset-us', dest='offset_us', metavar='offset',
         default="5",
         help="Static scheduler offset in microseconds for the combined "
-        "DCTCP static+load-aware variant (default: 5)")
+        "DCTCP static-scheduler variant (default: 5)")
 parser.add_argument('--dctcp-netem-loss', dest='dctcp_netem_loss',
         default="", help="Optional tc netem loss to apply during DCTCP "
         "variant runs, such as '0.5%%' (default: none)")

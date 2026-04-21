@@ -75,7 +75,7 @@ usage() {
 Usage: run_dctcp_final.sh [options]
 
 Run the cp_basic-style final comparison for Homa vs DCTCP vs
-DCTCP + static scheduler + load-aware balancing.
+DCTCP + static scheduler.
 
 Options:
   --seconds S            Duration for each timed phase (default: 5)
@@ -287,7 +287,7 @@ for i in $(seq 0 $((num_nodes-1))); do
 done
 EOF
 
-log run "Running final basic benchmark for Homa, DCTCP, and DCTCP + static scheduler + load-aware"
+log run "Running final basic benchmark for Homa, DCTCP, and DCTCP + static scheduler"
 BASIC_OUTPUT="$LOCAL_RUN_DIR/basic_output.txt"
 mkdir -p "$LOCAL_RUN_DIR"
 REMOTE_CMD="cd $REMOTE_REPO_DIR/util && timeout $TIMEOUT_SECONDS ./cp_dctcp_final_basic -n $NUM_NODES -s $RUN_SECONDS --offset-us $OFFSET_US -l $LOG_DIR"
@@ -310,7 +310,7 @@ if find "$LOCAL_LOG_DIR" -maxdepth 1 -name 'node-*.log' -print -quit | grep -q .
         --title "DCTCP Final Basic Summary"
 
     log summary "Saved summary table"
-    sed -n '/^| Metric | Homa | DCTCP | DCTCP + Static + Load-Aware |$/,/^$/p' "$SUMMARY_MD"
+    sed -n '/^| Metric | Homa | DCTCP | DCTCP + Static Scheduler |$/,/^$/p' "$SUMMARY_MD"
 else
     log warn "Skipping summary generation because node-*.log files were not fetched"
     if [[ -f "$LOCAL_LOG_DIR/reports/cperf.log" ]]; then
