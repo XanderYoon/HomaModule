@@ -19,6 +19,7 @@ REMOTE_COMPAT_REPO_LINK="${REMOTE_COMPAT_REPO_LINK:-~/homaModule}"
 
 REPO_URL="${HOMA_REPO_URL:-https://github.com/XanderYoon/HomaModule.git}"
 REPO_BRANCH="${HOMA_REPO_BRANCH:-main}"
+REPO_REF="${HOMA_REPO_REF:-origin/$REPO_BRANCH}"
 
 START_SCRIPT="${START_SCRIPT:-start_xl170}"
 LINK_MBPS="${LINK_MBPS:-25000}"
@@ -60,6 +61,10 @@ Common examples:
 
 Environment knobs:
   CLOUDLAB_USER   Remote username for all CloudLab nodes
+  HOMA_REPO_URL   Git repo to clone/fetch on node0, default: $REPO_URL
+  HOMA_REPO_BRANCH  Branch name used when cloning, default: $REPO_BRANCH
+  HOMA_REPO_REF   Git ref/branch/tag/commit to reset node0 to before rebuild,
+                  default: $REPO_REF
   PAPER_MTU       MTU for the private experiment NIC ($PRIVATE_IFACE), default: $PAPER_MTU
   MGMT_MTU        MTU for the management NIC ($MGMT_IFACE), default: $MGMT_MTU
   PRIVATE_IFACE   Private experiment NIC, default: $PRIVATE_IFACE
@@ -197,6 +202,7 @@ prepare_node0() {
         fi
 
         requested_branch='$REPO_BRANCH'
+        requested_ref='$REPO_REF'
         resolved_branch=''
         if [[ -n \"\$requested_branch\" ]]; then
             resolved_branch=\"\$requested_branch\"
@@ -208,23 +214,31 @@ prepare_node0() {
         fi
 
         if [[ -d $REMOTE_REPO_DIR/.git ]]; then
-            git -C $REMOTE_REPO_DIR fetch origin
-            if git -C $REMOTE_REPO_DIR show-ref --verify --quiet refs/remotes/origin/\$resolved_branch; then
-                git -C $REMOTE_REPO_DIR checkout \$resolved_branch
-                git -C $REMOTE_REPO_DIR pull --ff-only origin \$resolved_branch || true
-            else
-                current_branch=\"\$(git -C $REMOTE_REPO_DIR rev-parse --abbrev-ref HEAD)\"
-                echo \"Requested/default branch '\$resolved_branch' is not present in existing clone; keeping current branch '\$current_branch'\" >&2
-                resolved_branch=\"\$current_branch\"
-            fi
+            git -C $REMOTE_REPO_DIR remote set-url origin $REPO_URL
+            git -C $REMOTE_REPO_DIR fetch --all --tags --prune
         else
             git clone --branch \$resolved_branch $REPO_URL $REMOTE_REPO_DIR
+            git -C $REMOTE_REPO_DIR fetch --all --tags --prune
+        fi
+
+        if git -C $REMOTE_REPO_DIR rev-parse --verify --quiet \"\$requested_ref\" >/dev/null; then
+            git -C $REMOTE_REPO_DIR checkout --detach \"\$requested_ref\"
+            git -C $REMOTE_REPO_DIR reset --hard \"\$requested_ref\"
+        elif git -C $REMOTE_REPO_DIR show-ref --verify --quiet refs/remotes/origin/\$resolved_branch; then
+            git -C $REMOTE_REPO_DIR checkout --detach \"origin/\$resolved_branch\"
+            git -C $REMOTE_REPO_DIR reset --hard \"origin/\$resolved_branch\"
+        else
+            echo \"Requested ref '\$requested_ref' and branch '\$resolved_branch' are unavailable in $REMOTE_REPO_DIR\" >&2
+            exit 1
         fi
 
         ln -sfn $REMOTE_REPO_DIR $REMOTE_COMPAT_REPO_LINK
 
         cd $REMOTE_REPO_DIR
+        git rev-parse HEAD
+        make clean >/dev/null 2>&1 || true
         make -j
+        make -C util clean >/dev/null 2>&1 || true
         make -C util -j
 
         cp cloudlab/bin/* ~/bin/
