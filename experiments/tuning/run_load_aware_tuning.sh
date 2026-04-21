@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BENCH_SCRIPT="cp_transport_vs_load_aware"
-BENCH_LABEL="load-aware tuning"
+BENCH_LABEL="load-aware comparison"
 RESULT_SUBDIR="load_aware"
 LOG_PREFIX="load_aware"
 

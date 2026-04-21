@@ -73,6 +73,7 @@ bool tcp_trunc = true;
 bool tcp_fastopen = false;
 bool tcp_client_pooling = false;
 int tcp_pool_size = 1;
+bool tcp_load_aware = false;
 bool tcp_multiplex = false;
 int tcp_multiplex_sessions = 1;
 int port_receivers = 1;
@@ -2253,6 +2254,7 @@ class tcp_client : public client {
     public:
 	tcp_client(int id);
 	virtual ~tcp_client();
+	int choose_server();
 	int choose_pooled_slot(int server);
 	void read(tcp_connection *connection, int pid);
 	void receiver(int id);
@@ -2423,6 +2425,30 @@ int tcp_client::choose_pooled_slot(int server)
 	return slot;
 }
 
+int tcp_client::choose_server()
+{
+	if (!tcp_load_aware) {
+		int server = request_servers[next_server];
+		next_server++;
+		if (next_server >= request_servers.size())
+			next_server = 0;
+		return server;
+	}
+	uint64_t best_backlog = ~0ull;
+	int best_server = -1;
+	size_t start = next_server;
+	for (size_t offset = 0; offset < num_servers; offset++) {
+		size_t index = (start + offset) % num_servers;
+		uint64_t backlog = bytes_sent[index] - bytes_rcvd[index];
+		if ((best_server < 0) || (backlog < best_backlog)) {
+			best_server = static_cast<int>(index);
+			best_backlog = backlog;
+		}
+	}
+	next_server = (best_server + 1) % num_servers;
+	return best_server;
+}
+
 /**
  * tcp_client::~tcp_client() - Destructor for tcp_client objects;
  * will terminate threads created for this client.
@@ -2516,10 +2542,7 @@ void tcp_client::sender()
 		}
 		
 		rinfos[slot].start_time = now;
-		server = request_servers[next_server];
-		next_server++;
-		if (next_server >= request_servers.size())
-			next_server = 0;
+		server = choose_server();
 		
 		header.length = request_lengths[next_length];
 		if ((header.length > HOMA_MAX_MESSAGE_LENGTH) && tcp_trunc)
@@ -2821,6 +2844,7 @@ int client_cmd(std::vector<string> &words)
 	tcp_fastopen = false;
 	tcp_client_pooling = false;
 	tcp_pool_size = 1;
+	tcp_load_aware = false;
 	tcp_multiplex = false;
 	tcp_multiplex_sessions = 1;
 	tcp_trunc = true;
@@ -2873,7 +2897,7 @@ int client_cmd(std::vector<string> &words)
 		} else if (strcmp(option, "--tcp-no-pooling") == 0) {
 			tcp_client_pooling = false;
 		} else if (strcmp(option, "--tcp-load-aware") == 0) {
-			continue;
+			tcp_load_aware = true;
 		} else if (strcmp(option, "--tcp-pool-size") == 0) {
 			if (!parse(words, i+1, &tcp_pool_size, option, "integer"))
 				return 0;
