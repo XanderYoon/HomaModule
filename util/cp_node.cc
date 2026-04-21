@@ -69,6 +69,7 @@ bool is_server = false;
 int id = -1;
 double net_gbps = 0.0;
 bool tcp_trunc = true;
+bool tcp_fastopen = false;
 int port_receivers = 1;
 int port_threads = 1;
 std::string protocol_string;
@@ -1123,6 +1124,17 @@ tcp_server::tcp_server(int port, int id, int num_threads)
 				"socket: %s",
 				strerror(errno));
 		exit(1);
+	}
+	if (tcp_fastopen) {
+#ifdef TCP_FASTOPEN
+		if (setsockopt(listen_fd, IPPROTO_TCP, TCP_FASTOPEN, &option_value,
+				sizeof(option_value)) != 0) {
+			log(NORMAL, "WARNING: couldn't enable TCP_FASTOPEN on "
+					"listen socket: %s\n", strerror(errno));
+		}
+#else
+		log(NORMAL, "WARNING: TCP_FASTOPEN not supported by headers\n");
+#endif
 	}
 	struct sockaddr_in addr;
 	addr.sin_family = AF_INET;
@@ -2211,6 +2223,19 @@ tcp_client::tcp_client(int id)
 					strerror(errno));
 			exit(1);
 		}
+		int flag = 1;
+		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#ifdef TCP_FASTOPEN_CONNECT
+		if (tcp_fastopen) {
+			if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &flag,
+					sizeof(flag)) != 0) {
+				log(NORMAL, "WARNING: couldn't enable TCP_FASTOPEN_CONNECT "
+						"for %s: %s\n",
+						print_address(&server_addrs[i]),
+						strerror(errno));
+			}
+		}
+#endif
 		if (connect(fd, reinterpret_cast<struct sockaddr *>(
 				&server_addrs[i]),
 				sizeof(server_addrs[i])) == -1) {
@@ -2218,13 +2243,11 @@ tcp_client::tcp_client(int id)
 					"to %s: %s\n",
 					print_address(&server_addrs[i]),
 					strerror(errno));
-			exit(1);
-		}
-		int flag = 1;
-		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-		if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
-			log(NORMAL, "FATAL: couldn't set O_NONBLOCK on socket "
-					"to server %s: %s",
+		exit(1);
+	}
+	if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
+		log(NORMAL, "FATAL: couldn't set O_NONBLOCK on socket "
+				"to server %s: %s",
 					print_address(&server_addrs[i]),
 					strerror(errno));
 			exit(1);
@@ -2638,6 +2661,7 @@ int client_cmd(std::vector<string> &words)
 	port_receivers = 1;
 	protocol = "homa";
 	server_nodes = 1;
+	tcp_fastopen = false;
 	tcp_trunc = true;
 	unloaded = 0;
 	workload = "100";
@@ -2676,7 +2700,7 @@ int client_cmd(std::vector<string> &words)
 		} else if (strcmp(option, "--iovec") == 0) {
 			client_iovec = true;
 		} else if (strcmp(option, "--tcp-fastopen") == 0) {
-			continue;
+			tcp_fastopen = true;
 		} else if (strcmp(option, "--tcp-multiplex") == 0) {
 			continue;
 		} else if (strcmp(option, "--tcp-multiplex-sessions") == 0) {
@@ -2952,10 +2976,11 @@ int log_cmd(std::vector<string> &words)
 int server_cmd(std::vector<string> &words)
 {
 	first_port = 4000;
-        protocol = "homa";
+	protocol = "homa";
 	port_threads = 1;
 	server_ports = 1;
 	server_iovec = false;
+	tcp_fastopen = false;
 	
 	for (unsigned i = 1; i < words.size(); i++) {
 		const char *option = words[i].c_str();
@@ -2974,6 +2999,8 @@ int server_cmd(std::vector<string> &words)
 			if (!parse(words, i+1, &server_ports, option, "integer"))
 				return 0;
 			i++;
+		} else if (strcmp(option, "--tcp-fastopen") == 0) {
+			tcp_fastopen = true;
 		} else if (strcmp(option, "--protocol") == 0) {
 			if ((i + 1) >= words.size()) {
 				printf("No value provided for %s\n",
