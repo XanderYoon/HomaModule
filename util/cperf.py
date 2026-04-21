@@ -800,7 +800,7 @@ def set_netem_loss(nodes, loss):
         % (shlex.quote(str(loss))))
     for id in nodes:
         subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id,
-                "bash", "-lc", script], check=True)
+                "bash", "-lc", shlex.quote(script)], check=True)
 
 def clear_netem_loss(nodes):
     """
@@ -812,7 +812,7 @@ def clear_netem_loss(nodes):
         "sudo tc qdisc del dev \"$iface\" root >/dev/null 2>&1 || true")
     for id in nodes:
         subprocess.run(["ssh"] + SSH_OPTIONS + ["node-%d" % id,
-                "bash", "-lc", script], check=True)
+                "bash", "-lc", shlex.quote(script)], check=True)
 
 def write_tcp_counter_reports(name, deltas, qdisc_stats):
     """
