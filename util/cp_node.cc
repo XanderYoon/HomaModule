@@ -49,6 +49,7 @@
 #include <optional>
 #include <random>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "dist.h"
@@ -72,6 +73,8 @@ bool tcp_trunc = true;
 bool tcp_fastopen = false;
 bool tcp_client_pooling = false;
 int tcp_pool_size = 1;
+bool tcp_multiplex = false;
+int tcp_multiplex_sessions = 1;
 int port_receivers = 1;
 int port_threads = 1;
 std::string protocol_string;
@@ -462,6 +465,36 @@ struct message_header {
 	uint32_t msg_id;
 };
 
+struct tcp_frame_header {
+	uint32_t stream_id;
+	uint32_t message_length;
+	uint32_t payload_length;
+};
+
+static constexpr int TCP_FRAME_DATA = 4096;
+
+struct tcp_outgoing_stream {
+	message_header header;
+	int bytes_sent;
+
+	explicit tcp_outgoing_stream(const message_header& header)
+		: header(header)
+		, bytes_sent(0)
+	{}
+};
+
+struct tcp_incoming_stream {
+	int message_length;
+	int bytes_received;
+	message_header header;
+
+	tcp_incoming_stream()
+		: message_length(0)
+		, bytes_received(0)
+		, header()
+	{}
+};
+
 /**
  * init_server_addrs() - Set up the server_addrs table (addresses of the
  * server/port combinations that clients will communicate with), based on
@@ -557,6 +590,7 @@ class tcp_connection {
 	bool send_message(message_header *header);
 	void set_epoll_events(int epoll_fd, uint32_t events);
 	bool xmit();
+	int active_streams;
 	
 	/** @fd: File descriptor to use for reading and writing data. */
 	int fd;
@@ -591,12 +625,10 @@ class tcp_connection {
 	 * then it has not yet been fully read.
 	 */
 	message_header header;
-	
-	/**
-	 * @outgoing: queue of headers for messages waiting to be
-	 * transmitted. The first entry may have been partially transmitted.
-	 */
-	std::deque<message_header> outgoing;
+	std::vector<char> incoming_bytes;
+	std::unordered_map<uint32_t, tcp_incoming_stream> incoming_streams;
+	std::deque<tcp_outgoing_stream> outgoing;
+	std::deque<message_header> legacy_outgoing;
 	
 	/*
 	 * @bytes_sent: Nonzero means we have sent part of the first message
@@ -604,6 +636,11 @@ class tcp_connection {
 	 * successfully transmitted.
 	 */
 	int bytes_sent;
+	size_t next_outgoing;
+	std::vector<char> current_frame;
+	size_t current_frame_offset;
+	size_t current_frame_stream;
+	int current_frame_payload;
 	
 	/**
 	 * @epoll_events: OR-ed combination of epoll events such as EPOLLIN
@@ -628,14 +665,23 @@ class tcp_connection {
  */
 tcp_connection::tcp_connection(int fd, uint32_t epoll_id, int port,
 		struct sockaddr_in peer)
-	: fd(fd)
+	: active_streams(0)
+	, fd(fd)
 	, epoll_id(epoll_id)
         , port(port)
 	, peer(peer)
 	, bytes_received(0)
         , header()
+        , incoming_bytes()
+        , incoming_streams()
         , outgoing()
+        , legacy_outgoing()
         , bytes_sent(0)
+        , next_outgoing(0)
+        , current_frame()
+        , current_frame_offset(0)
+        , current_frame_stream(0)
+        , current_frame_payload(0)
         , epoll_events(0)
 {
 }
@@ -646,7 +692,7 @@ tcp_connection::tcp_connection(int fd, uint32_t epoll_id, int port,
  */
 inline size_t tcp_connection::pending()
 {
-	return outgoing.size();
+	return tcp_multiplex ? outgoing.size() : legacy_outgoing.size();
 }
 
 /**
@@ -709,55 +755,60 @@ int tcp_connection::read(bool loop,
 			
 		}
 	
-		/*
-		 * Process incoming bytes (could contains parts of multiple
-		 * requests). The first 4 bytes of each request give its
-		 * length.
-		 */
-		next = buffer;
-		while (count > 0) {
-			/* First, fill in the message header with incoming data
-			 * (there's no guarantee that a single read will return
-			 * all of the bytes needed for these).
-			 */
-			int header_bytes = sizeof32(message_header)
-				- bytes_received;
-			if (header_bytes > 0) {
-				if (count < header_bytes)
-					header_bytes = count;
-				char *dst = reinterpret_cast<char *>(&header);
-				memcpy(dst + bytes_received, next, header_bytes);
-				bytes_received += header_bytes;
-				next += header_bytes;
-				count -= header_bytes;
-				if (bytes_received < sizeof32(message_header)) {
-					tt("Received %d header bytes; need %d "
-							"more for complete "
-							"header", count,
-							sizeof32(message_header)
-							- bytes_received);
+		if (!tcp_multiplex) {
+			next = buffer;
+			while (count > 0) {
+				int header_bytes = sizeof32(message_header)
+					- bytes_received;
+				if (header_bytes > 0) {
+					if (count < header_bytes)
+						header_bytes = count;
+					char *dst = reinterpret_cast<char *>(&header);
+					memcpy(dst + bytes_received, next, header_bytes);
+					bytes_received += header_bytes;
+					next += header_bytes;
+					count -= header_bytes;
+					if (bytes_received < sizeof32(message_header))
+						break;
+				}
+				int needed = header.length - bytes_received;
+				if (count < needed) {
+					bytes_received += count;
 					break;
 				}
+				count -= needed;
+				next += needed;
+				func(&header);
+				bytes_received = 0;
 			}
-
-			/* At this point we know the request length, so read until
-			 * we've got a full request.
-			 */
-			int needed = header.length - bytes_received;
-			if (count < needed) {
-				tt("Received %d bytes for cid 0x%08x, id %d; "
-						"need %d more for complete "
-						"message", count, header.cid,
-						header.msg_id, needed-count);
-				bytes_received += count;
-				break;
+		} else {
+			incoming_bytes.insert(incoming_bytes.end(), buffer, buffer + count);
+			while (incoming_bytes.size() >= sizeof(tcp_frame_header)) {
+				tcp_frame_header frame;
+				memcpy(&frame, incoming_bytes.data(), sizeof(frame));
+				size_t frame_bytes = sizeof(frame) +
+						static_cast<size_t>(frame.payload_length);
+				if (incoming_bytes.size() < frame_bytes)
+					break;
+				tcp_incoming_stream &stream = incoming_streams[frame.stream_id];
+				if (stream.bytes_received == 0)
+					stream.message_length = frame.message_length;
+				const char *payload = incoming_bytes.data() + sizeof(frame);
+				if (stream.bytes_received < sizeof32(message_header)) {
+					int copy = sizeof32(message_header) - stream.bytes_received;
+					if (copy > static_cast<int>(frame.payload_length))
+						copy = frame.payload_length;
+					memcpy(reinterpret_cast<char *>(&stream.header)
+							+ stream.bytes_received, payload, copy);
+				}
+				stream.bytes_received += frame.payload_length;
+				if (stream.bytes_received == stream.message_length) {
+					func(&stream.header);
+					incoming_streams.erase(frame.stream_id);
+				}
+				incoming_bytes.erase(incoming_bytes.begin(),
+						incoming_bytes.begin() + frame_bytes);
 			}
-
-			/* We now have a full message. */
-			count -= needed;
-			next += needed;
-			func(&header);
-			bytes_received = 0;
 		}
 		if (!loop)
 			return 0;
@@ -803,9 +854,13 @@ bool tcp_connection::send_message(message_header *header)
 {
 	if (header->length < sizeof32(*header))
 		header->length = sizeof32(*header);
+	if (!tcp_multiplex) {
+		legacy_outgoing.emplace_back(*header);
+		if (legacy_outgoing.size() > 1)
+			return false;
+		return xmit();
+	}
 	outgoing.emplace_back(*header);
-	if (outgoing.size() > 1)
-		return false;
 	return xmit();
 }
 
@@ -825,46 +880,116 @@ bool tcp_connection::xmit()
 	ssize_t result;
 	
 	while (true) {
+		if (!tcp_multiplex) {
+			if (legacy_outgoing.size() == 0)
+				return true;
+			header = &legacy_outgoing[0];
+			if (bytes_sent < sizeof32(*header)) {
+				*(reinterpret_cast<message_header *>(buffer)) = *header;
+				start = bytes_sent;
+			} else
+				start = 0;
+			send_length = header->length - bytes_sent;
+			if (send_length > (sizeof32(buffer) - start))
+				send_length = sizeof32(buffer) - start;
+			result = send(fd, buffer + start, send_length,
+					MSG_NOSIGNAL|MSG_DONTWAIT);
+			if (result >= 0)
+				bytes_sent += result;
+			else {
+				if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+					return false;
+				if ((errno == EPIPE) || (errno == ECONNRESET))
+					bytes_sent = header->length;
+				else {
+					log(NORMAL, "FATAL: error sending TCP message "
+							"to %s: %s (port %d)\n",
+							print_address(&peer),
+							strerror(errno), port);
+					exit(1);
+				}
+			}
+			if (bytes_sent < header->length)
+				continue;
+			bytes_sent = 0;
+			legacy_outgoing.pop_front();
+			continue;
+		}
 		if (outgoing.size() == 0)
 			return true;
-		header = &outgoing[0];
-		if (bytes_sent < sizeof32(*header)) {
-			*(reinterpret_cast<message_header *>(buffer))
-					= *header;
-			start = bytes_sent;
-		} else
-			start = 0;
-		send_length = header->length - bytes_sent;
-		if (send_length > (sizeof32(buffer) - start))
-			send_length = sizeof32(buffer) - start;
-		result = send(fd, buffer + start, send_length,
+		if (current_frame.empty()) {
+			if (next_outgoing >= outgoing.size())
+				next_outgoing = 0;
+			current_frame_stream = next_outgoing;
+			tcp_outgoing_stream &stream = outgoing[current_frame_stream];
+			int remaining = stream.header.length - stream.bytes_sent;
+			int payload = remaining;
+			if (payload > TCP_FRAME_DATA)
+				payload = TCP_FRAME_DATA;
+			tcp_frame_header frame = {
+				stream.header.msg_id,
+				static_cast<uint32_t>(stream.header.length),
+				static_cast<uint32_t>(payload)
+			};
+			current_frame.resize(sizeof(frame) + payload);
+			memcpy(current_frame.data(), &frame, sizeof(frame));
+			if (stream.bytes_sent < sizeof32(message_header)) {
+				size_t header_offset = static_cast<size_t>(stream.bytes_sent);
+				size_t copy = static_cast<size_t>(sizeof32(message_header))
+						- header_offset;
+				if (copy > static_cast<size_t>(payload))
+					copy = static_cast<size_t>(payload);
+				if (copy > 0) {
+					memcpy(current_frame.data() + sizeof(frame),
+							reinterpret_cast<char *>(&stream.header)
+							+ header_offset, copy);
+				}
+				if (copy < static_cast<size_t>(payload)) {
+					memset(current_frame.data() + sizeof(frame) + copy, 0,
+							static_cast<size_t>(payload) - copy);
+				}
+			} else {
+				memset(current_frame.data() + sizeof(frame), 0, payload);
+			}
+			current_frame_offset = 0;
+			current_frame_payload = payload;
+		}
+		result = send(fd, current_frame.data() + current_frame_offset,
+				current_frame.size() - current_frame_offset,
 				MSG_NOSIGNAL|MSG_DONTWAIT);
-		if (result >= 0)
-			bytes_sent += result;
-		else {
+		if (result < 0) {
 			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
 				return false;
 			if ((errno == EPIPE) || (errno == ECONNRESET))
-				bytes_sent = header->length;
+				current_frame_offset = current_frame.size();
 			else {
-				log(NORMAL, "FATAL: error sending TCP message "
+				log(NORMAL, "FATAL: error sending multiplexed TCP message "
 						"to %s: %s (port %d)\n",
-						print_address(&peer),
-						strerror(errno), port);
+						print_address(&peer), strerror(errno), port);
 				exit(1);
 			}
+		} else {
+			current_frame_offset += result;
 		}
-		if (bytes_sent < header->length) {
-			tt("Sent %d bytes (out of %d) on cid 0x%08x",
-					result, header->length, header->cid);
-			continue;
+		if (current_frame_offset < current_frame.size())
+			return false;
+		tcp_outgoing_stream &stream = outgoing[current_frame_stream];
+		stream.bytes_sent += current_frame_payload;
+		if (stream.bytes_sent >= stream.header.length) {
+			outgoing.erase(outgoing.begin() + current_frame_stream);
+			if (outgoing.size() == 0) {
+				next_outgoing = 0;
+			} else if (current_frame_stream >= outgoing.size()) {
+				next_outgoing = 0;
+			} else {
+				next_outgoing = current_frame_stream;
+			}
+		} else {
+			next_outgoing = (current_frame_stream + 1) % outgoing.size();
 		}
-		bytes_sent = 0;
-		tt("Finished sending TCP message, cid 0x%08x, id %d, length %d, "
-				"%u messages queued", header->cid,
-				header->msg_id, header->length,
-				outgoing.size() - 1);
-		outgoing.pop_front();
+		current_frame.clear();
+		current_frame_offset = 0;
+		current_frame_payload = 0;
 	}
 }
 
@@ -2405,9 +2530,18 @@ void tcp_client::sender()
 		header.freeze = freeze[header.cid.server];
 		int connection_slot = choose_pooled_slot(server);
 		size_t old_pending = connections[connection_slot]->pending();
+		if (tcp_multiplex
+				&& (connections[connection_slot]->active_streams
+				>= tcp_multiplex_sessions)) {
+			rinfos[slot].active = false;
+			std::this_thread::yield();
+			continue;
+		}
 		tt("Sending TCP request, cid 0x%08x, id %u, length %d, pid %d",
 				header.cid, header.msg_id, header.length,
 				pid);
+		if (tcp_multiplex)
+			connections[connection_slot]->active_streams++;
 		if ((!connections[connection_slot]->send_message(&header))
 				&& (old_pending == 0)) {
 			blocked.push_back(connections[connection_slot]);
@@ -2499,10 +2633,12 @@ void tcp_client::receiver(int receiver_id)
  */
 void tcp_client::read(tcp_connection *connection, int pid)
 {
-	int error = connection->read(epollet, [this, pid]
+	int error = connection->read(epollet, [this, pid, connection]
 			(message_header *header) {
 		uint64_t end_time = rdtsc();
 		record(end_time, header);
+		if (tcp_multiplex && (connection->active_streams > 0))
+			connection->active_streams--;
 		tt("Response for cid 0x%08x received by pid %d", pid);
 		bytes_rcvd[first_id[header->cid.server]
 				+ header->cid.server_port] += header->length;
@@ -2685,6 +2821,8 @@ int client_cmd(std::vector<string> &words)
 	tcp_fastopen = false;
 	tcp_client_pooling = false;
 	tcp_pool_size = 1;
+	tcp_multiplex = false;
+	tcp_multiplex_sessions = 1;
 	tcp_trunc = true;
 	unloaded = 0;
 	workload = "100";
@@ -2725,9 +2863,9 @@ int client_cmd(std::vector<string> &words)
 		} else if (strcmp(option, "--tcp-fastopen") == 0) {
 			tcp_fastopen = true;
 		} else if (strcmp(option, "--tcp-multiplex") == 0) {
-			continue;
+			tcp_multiplex = true;
 		} else if (strcmp(option, "--tcp-multiplex-sessions") == 0) {
-			if (!parse(words, i+1, &ignored_int, option, "integer"))
+			if (!parse(words, i+1, &tcp_multiplex_sessions, option, "integer"))
 				return 0;
 			i++;
 		} else if (strcmp(option, "--tcp-client-pooling") == 0) {
@@ -2791,6 +2929,10 @@ int client_cmd(std::vector<string> &words)
 		}
 	}
 	init_server_addrs();
+	if (tcp_multiplex_sessions < 1) {
+		printf("--tcp-multiplex-sessions must be at least 1\n");
+		return 0;
+	}
 	if (tcp_pool_size < 1) {
 		printf("--tcp-pool-size must be at least 1\n");
 		return 0;
@@ -3008,6 +3150,7 @@ int server_cmd(std::vector<string> &words)
 	server_ports = 1;
 	server_iovec = false;
 	tcp_fastopen = false;
+	tcp_multiplex = false;
 	
 	for (unsigned i = 1; i < words.size(); i++) {
 		const char *option = words[i].c_str();
@@ -3028,6 +3171,8 @@ int server_cmd(std::vector<string> &words)
 			i++;
 		} else if (strcmp(option, "--tcp-fastopen") == 0) {
 			tcp_fastopen = true;
+		} else if (strcmp(option, "--tcp-multiplex") == 0) {
+			tcp_multiplex = true;
 		} else if (strcmp(option, "--protocol") == 0) {
 			if ((i + 1) >= words.size()) {
 				printf("No value provided for %s\n",

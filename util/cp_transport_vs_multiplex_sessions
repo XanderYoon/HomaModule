@@ -13,43 +13,42 @@ DEFAULTS_25G = {
     "tcp_server_ports":    8,
 }
 
-DEFAULT_SESSION_COUNTS = [1, 2, 4, 8]
 load_info = [["w2", 3.2], ["w3", 14], ["w4", 20], ["w5", 20]]
-WARN_PLOT_SAMPLES = 1000
 
-def parse_int_list(value, option_name):
+def parse_session_count(value, option_name):
     try:
-        values = [int(part.strip()) for part in value.split(",") if part.strip()]
+        session_count = int(value)
     except ValueError:
         raise Error("Illegal value for %s: %s" % (option_name, value))
-    if len(values) == 0:
-        raise Error("%s must contain at least one integer" % (option_name))
-    for item in values:
-        if item <= 0:
-            raise Error("%s values must be positive: %s" % (option_name, value))
-    return values
+    if session_count <= 0:
+        raise Error("%s values must be positive: %s" % (option_name, value))
+    return session_count
 
-def make_variants(session_counts):
-    variants = [
+def make_variants(session_count):
+    return [
         {
             "name": "dctcp",
             "label": "DCTCP",
+            "tcp_fastopen": False,
             "tcp_client_pooling": False,
+            "tcp_multiplex": False,
+            "tcp_multiplex_sessions": 1,
+            "tcp_pool_size": 1,
             "color99": dctcp_color,
             "color50": dctcp_color2,
         },
-    ]
-    for index, session_count in enumerate(session_counts):
-        variants.append({
-            "name": "dctcp_multiplex_s%d" % (session_count),
-            "label": "HTTP/2 Max Streams = %d" % (session_count),
+        {
+            "name": "dctcp_multiplex",
+            "label": "DCTCP + Multiplexing (%d)" % (session_count),
+            "tcp_fastopen": False,
             "tcp_client_pooling": True,
             "tcp_multiplex": True,
             "tcp_multiplex_sessions": session_count,
-            "color99": pyplot_colors[((index + 4) * 2) % len(pyplot_colors)],
-            "color50": pyplot_colors[((index + 4) * 2 + 1) % len(pyplot_colors)],
-        })
-    return variants
+            "tcp_pool_size": 1,
+            "color99": pyplot_colors[4],
+            "color50": pyplot_colors[6],
+        },
+    ]
 
 def apply_variant_options(options, variant):
     configured = copy.deepcopy(options)
@@ -76,29 +75,9 @@ def configure_variant_environment(options, all_nodes):
             "3" if getattr(options, "tcp_fastopen", False) else "0",
             all_nodes)
 
-warned_sparse_experiments = set()
-
-def plot_ready(experiment):
-    try:
-        digest = get_digest(experiment)
-    except Exception as e:
-        log("Skipping %s in plots: %s" % (experiment, str(e)))
-        return False
-    if digest["total_messages"] <= 0 or (len(digest["cum_frac"]) == 0):
-        log("Skipping %s in plots: no usable RTT samples available"
-                % (experiment))
-        return False
-    if (digest["total_messages"] < WARN_PLOT_SAMPLES) and \
-            (experiment not in warned_sparse_experiments):
-        log("Including %s in plots despite sparse data: only %d RTT samples"
-                % (experiment, digest["total_messages"]))
-        warned_sparse_experiments.add(experiment)
-    return True
-
 parser = get_parser(description=
-        'Measures slowdown as a function of message size for DCTCP and '
-        'HTTP/2-style multiplexing variants while sweeping the approximate '
-        'SETTINGS_MAX_CONCURRENT_STREAMS limit.',
+        'Measures slowdown as a function of message size for baseline DCTCP '
+        'and baseline DCTCP with only application-layer multiplexing.',
         usage='%(prog)s [options]')
 parser.set_defaults(**DEFAULTS_25G)
 parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
@@ -106,14 +85,14 @@ parser.add_argument('--servers', dest='num_servers', type=int, metavar='count',
         "and this value indicates the number of server nodes; all other "
         "nodes will be clients. If 0, each node runs both a client and a "
         "server (default: 0)")
-parser.add_argument('--multiplex-session-counts', dest='multiplex_session_counts',
-        metavar='counts', default="1,2,4,8",
-        help="Comma-separated HTTP/2 max-concurrent-stream values to compare "
-        "(default: 1,2,4,8)")
+parser.add_argument('--multiplex-sessions', dest='multiplex_sessions',
+        metavar='count', default="4",
+        help="Max concurrent logical streams per shared TCP session "
+        "(default: 4)")
 options = parser.parse_args()
-session_counts = parse_int_list(options.multiplex_session_counts,
-        "--multiplex-session-counts")
-VARIANTS = make_variants(session_counts)
+session_count = parse_session_count(options.multiplex_sessions,
+        "--multiplex-sessions")
+VARIANTS = make_variants(session_count)
 init(options)
 if options.num_servers <= 0:
     servers = range(0, options.num_nodes)
@@ -128,7 +107,12 @@ else:
     options.num_clients = options.num_nodes - options.num_servers
     servers = range(0, options.num_servers)
     clients = range(options.num_servers, options.num_nodes)
-    bw_multiplier = min(options.num_servers, options.num_clients) / options.num_clients
+    options.server_ports = options.server_ports * 2
+    options.client_ports = options.client_ports * 2
+    options.tcp_server_ports = options.tcp_server_ports * 2
+    options.tcp_client_ports = options.tcp_client_ports * 2
+    bw_multiplier = min(options.num_servers, options.num_clients) \
+            / options.num_clients
 
 if options.workload != "":
     load_info = [[options.workload, options.gbps]]
@@ -136,7 +120,6 @@ if options.workload != "":
 congestion = get_sysctl_parameter("net.ipv4.tcp_congestion_control")
 tcp_fastopen = get_sysctl_parameter("net.ipv4.tcp_fastopen")
 tcp_ecn = get_sysctl_parameter("net.ipv4.tcp_ecn")
-benchmark_error = None
 
 if not options.plot_only:
     for workload, bw in load_info:
@@ -163,41 +146,20 @@ if not options.plot_only:
                 configure_variant_environment(tcp_options,
                         range(0, options.num_nodes))
                 start_servers(servers, tcp_options)
-                for sample in range(options.samples):
-                    log("Running %s sample %d/%d for %s" % (
-                            variant["name"], sample + 1, options.samples,
-                            workload))
-                    run_experiment("%s_%s" % (variant["name"], workload),
-                            clients, tcp_options)
-                    if sample != (options.samples - 1):
-                        checkpoint("sample saved %s_%s sample %d/%d"
-                                % (variant["name"], workload, sample + 1,
-                                options.samples))
-                        time.sleep(options.sample_cooldown)
-                checkpoint("variant saved %s_%s" % (variant["name"], workload))
-                if variant != VARIANTS[-1]:
-                    time.sleep(options.variant_cooldown)
-        except Exception:
-            if benchmark_error is None:
-                benchmark_error = sys.exc_info()
+                run_experiment("%s_%s" % (variant["name"], workload),
+                        clients, tcp_options)
+        except Exception as e:
             log(traceback.format_exc())
 
-    try:
-        set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
-                range(0, options.num_nodes))
-        set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
-                range(0, options.num_nodes))
-        set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
-                range(0, options.num_nodes))
-        log("Stopping nodes")
-        stop_nodes()
-        scan_logs()
-    except Exception:
-        if benchmark_error is None:
-            benchmark_error = sys.exc_info()
-        log(traceback.format_exc())
-    if benchmark_error is not None:
-        raise benchmark_error[1].with_traceback(benchmark_error[2])
+    set_sysctl_parameter("net.ipv4.tcp_congestion_control", congestion,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_fastopen", tcp_fastopen,
+            range(0, options.num_nodes))
+    set_sysctl_parameter("net.ipv4.tcp_ecn", tcp_ecn,
+            range(0, options.num_nodes))
+    log("Stopping nodes")
+    stop_nodes()
+    scan_logs()
 
 for workload, bw in load_info:
     unloaded_exp = "unloaded_" + workload
@@ -214,8 +176,6 @@ for workload, bw in load_info:
     ax = start_slowdown_plot(title, 10000, first_exp)
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
-        if not plot_ready(exp):
-            continue
         plot_slowdown(ax, exp, "p99", "%s P99" % (variant["label"]),
                 color=variant["color99"])
         plot_slowdown(ax, exp, "p50", "%s P50" % (variant["label"]),
@@ -227,8 +187,6 @@ for workload, bw in load_info:
     ax = start_slowdown_plot(title + " P50", 10000, first_exp)
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
-        if not plot_ready(exp):
-            continue
         plot_slowdown(ax, exp, "p50", "%s P50" % (variant["label"]),
                 color=variant["color50"])
     save_plot_with_side_legend(ax,
@@ -238,8 +196,6 @@ for workload, bw in load_info:
     ax = start_slowdown_plot(title + " P99", P99_SLOWDOWN_MAX, first_exp)
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
-        if not plot_ready(exp):
-            continue
         plot_slowdown(ax, exp, "p99", "%s P99" % (variant["label"]),
                 color=variant["color99"])
     save_plot_with_side_legend(ax,
@@ -251,11 +207,7 @@ for workload, bw in load_info:
             "Cumulative Fraction Short Messages")
     for variant in VARIANTS:
         exp = "%s_%s" % (variant["name"], workload)
-        if not plot_ready(exp):
-            continue
         x, y = get_short_cdf(exp)
-        if len(x) == 0:
-            continue
         plt.plot(x, y, label=variant["label"], color=variant["color99"])
     plt.plot(unloaded_x, unloaded_y, label="Homa best case",
             color=unloaded_color)
