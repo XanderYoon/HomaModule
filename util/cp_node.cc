@@ -2024,6 +2024,7 @@ homa_client::homa_client(int id)
 			 * starting the sender; otherwise the initial RPCs
 			 * may appear to take a long time.
 			 */
+			std::this_thread::yield();
 		}
 		sending_thread.emplace(&homa_client::sender, this);
 	}
@@ -2475,6 +2476,7 @@ tcp_client::tcp_client(int id)
 		 * starting the sender; otherwise the initial RPCs
 		 * may appear to take a long time.
 		 */
+		std::this_thread::yield();
 	}
 	sending_thread.emplace(&tcp_client::sender, this);
 }
@@ -2769,8 +2771,18 @@ void tcp_client::sender()
 			{
 				std::lock_guard<std::recursive_mutex> lock(
 						connection_mutex);
-				if (blocked.size() == 0)
+				if (blocked.size() == 0) {
+					/* Nothing to drain; if we're also at max
+					 * outstanding RPCs, yield rather than burning
+					 * CPU — otherwise we starve other threads
+					 * (including receiver threads) when many
+					 * clients are backed up simultaneously.
+					 */
+					if ((total_requests - total_responses)
+							>= client_port_max)
+						std::this_thread::yield();
 					continue;
+				}
 				if (next_blocked >= blocked.size())
 					next_blocked = 0;
 				tcp_connection *connection = blocked[next_blocked];

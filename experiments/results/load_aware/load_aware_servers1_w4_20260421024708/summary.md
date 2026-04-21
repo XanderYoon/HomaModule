@@ -1,4 +1,4 @@
-# TFO comparison Summary
+# load-aware tuning Summary
 
 Latency percentiles are averaged across whatever RTT samples were successfully fetched for each experiment.
 TCP counters and qdisc drops are averaged across whatever repeated-run artifacts were available.
@@ -6,10 +6,11 @@ TCP counters and qdisc drops are averaged across whatever repeated-run artifacts
 ## w4
 
 Latency percentiles below are averages across repeated runs.
-| Metric | DCTCP | DCTCP + TFO |
+| Metric | DCTCP | DCTCP + Load-Aware |
 | --- | ---: | ---: |
-| RTT p50 (us) | 30,358.41 | 17,622.71 |
-| RTT p99 (us) | 271,016.59 | 273,499.59 |
+| RTT p50 (us) | 30,322.00 | 3,103.34 |
+| RTT p99 (us) | 271,015.84 | 1,042,470.81 |
 | Runs | 5 | 5 |
-| RTT samples/run | 121,875.00 | 47,186.00 |
-| Retrans segs | 25,313 | 58,657 |
+| RTT runs | 1 | 1 |
+| RTT samples/run | 53,463.00 | 61,181.00 |
+| Retrans segs | 26,309 | 32,846 |
