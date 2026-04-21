@@ -2459,11 +2459,11 @@ tcp_client::tcp_client(int id)
 		next_pooled_slot.push_back(0);
 		int pool_slots = tcp_client_pooling ? tcp_pool_size : 1;
 		for (int pool_index = 0; pool_index < pool_slots; pool_index++) {
-			int slot = connections.size();
+			/* Reserve pooled slots, but connect lazily on first use to
+			 * avoid startup storms when the configured pool is large.
+			 */
 			connections.emplace_back(nullptr);
 			connection_server.push_back(i);
-			if (tcp_client_pooling && !tcp_fastopen)
-				connect_server(i, slot, true);
 		}
 	}
 	
