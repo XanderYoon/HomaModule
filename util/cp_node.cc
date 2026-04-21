@@ -70,6 +70,8 @@ int id = -1;
 double net_gbps = 0.0;
 bool tcp_trunc = true;
 bool tcp_fastopen = false;
+bool tcp_client_pooling = false;
+int tcp_pool_size = 1;
 int port_receivers = 1;
 int port_threads = 1;
 std::string protocol_string;
@@ -2126,6 +2128,7 @@ class tcp_client : public client {
     public:
 	tcp_client(int id);
 	virtual ~tcp_client();
+	int choose_pooled_slot(int server);
 	void read(tcp_connection *connection, int pid);
 	void receiver(int id);
 	void sender(void);
@@ -2150,6 +2153,9 @@ class tcp_client : public client {
 	 *  @requests: total number of message bytes received from each server.
 	 */
 	std::atomic<uint64_t> *bytes_rcvd;
+
+	/** @next_pooled_slot: round-robin cursor for each server's pool. */
+	std::vector<int> next_pooled_slot;
 	
 	/**
 	 * @backups: total number of times that a stream was congested
@@ -2194,8 +2200,9 @@ tcp_client::tcp_client(int id)
 	: client(id)
 	, connections()
         , blocked()
-        , bytes_sent()
+	, bytes_sent()
         , bytes_rcvd(NULL)
+        , next_pooled_slot()
         , backups(0)
         , epoll_fd(-1)
 	, epollet((port_receivers > 1) ? EPOLLET : 0)
@@ -2207,6 +2214,7 @@ tcp_client::tcp_client(int id)
 	for (size_t i = 0; i < num_servers; i++) {
 		bytes_sent.push_back(0);
 		bytes_rcvd[i] = 0;
+		next_pooled_slot.push_back(0);
 	}
 	epoll_fd = epoll_create(10);
 	if (epoll_fd < 0) {
@@ -2216,54 +2224,57 @@ tcp_client::tcp_client(int id)
 	}
 	
 	for (uint32_t i = 0; i < server_addrs.size(); i++) {
-		int fd = socket(PF_INET, SOCK_STREAM, 0);
-		if (fd == -1) {
-			log(NORMAL, "FATAL: couldn't open TCP client "
-					"socket: %s\n",
-					strerror(errno));
-			exit(1);
-		}
-		int flag = 1;
-		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+		int pool_slots = tcp_client_pooling ? tcp_pool_size : 1;
+		for (int pool_index = 0; pool_index < pool_slots; pool_index++) {
+			int fd = socket(PF_INET, SOCK_STREAM, 0);
+			if (fd == -1) {
+				log(NORMAL, "FATAL: couldn't open TCP client "
+						"socket: %s\n",
+						strerror(errno));
+				exit(1);
+			}
+			int flag = 1;
+			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 #ifdef TCP_FASTOPEN_CONNECT
-		if (tcp_fastopen) {
-			if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &flag,
-					sizeof(flag)) != 0) {
-				log(NORMAL, "WARNING: couldn't enable TCP_FASTOPEN_CONNECT "
-						"for %s: %s\n",
+			if (tcp_fastopen) {
+				if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &flag,
+						sizeof(flag)) != 0) {
+					log(NORMAL, "WARNING: couldn't enable TCP_FASTOPEN_CONNECT "
+							"for %s: %s\n",
+							print_address(&server_addrs[i]),
+							strerror(errno));
+				}
+			}
+#endif
+			if (connect(fd, reinterpret_cast<struct sockaddr *>(
+					&server_addrs[i]),
+					sizeof(server_addrs[i])) == -1) {
+				log(NORMAL, "FATAL: client couldn't connect "
+						"to %s: %s\n",
 						print_address(&server_addrs[i]),
 						strerror(errno));
+				exit(1);
 			}
-		}
-#endif
-		if (connect(fd, reinterpret_cast<struct sockaddr *>(
-				&server_addrs[i]),
-				sizeof(server_addrs[i])) == -1) {
-			log(NORMAL, "FATAL: client couldn't connect "
-					"to %s: %s\n",
+			if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
+				log(NORMAL, "FATAL: couldn't set O_NONBLOCK on socket "
+						"to server %s: %s",
 					print_address(&server_addrs[i]),
 					strerror(errno));
-		exit(1);
-	}
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
-		log(NORMAL, "FATAL: couldn't set O_NONBLOCK on socket "
-				"to server %s: %s",
-					print_address(&server_addrs[i]),
-					strerror(errno));
-			exit(1);
+				exit(1);
+			}
+			struct sockaddr_in addr;
+			socklen_t length = sizeof(addr);
+			if (getsockname(fd, reinterpret_cast<struct sockaddr *>(&addr),
+					&length)) {
+				log(NORMAL, "FATAL: getsockname failed for TCP client: "
+						"%s\n", strerror(errno));
+				exit(1);
+			}
+			uint32_t slot = connections.size();
+			connections.emplace_back(new tcp_connection(fd, slot,
+					ntohs(addr.sin_port), server_addrs[i]));
+			connections[slot]->set_epoll_events(epoll_fd, EPOLLIN|epollet);
 		}
-		struct sockaddr_in addr;
-		socklen_t length = sizeof(addr);
-		if (getsockname(fd, reinterpret_cast<struct sockaddr *>(&addr),
-				&length)) {
-			log(NORMAL, "FATAL: getsockname failed for TCP client: "
-					"%s\n", strerror(errno));
-			exit(1);
-		}
-		connections.emplace_back(new tcp_connection(fd, i,
-				ntohs(addr.sin_port), server_addrs[i]));
-		connections[connections.size()-1]->set_epoll_events(epoll_fd,
-				EPOLLIN|epollet);
 	}
 	
 	for (int i = 0; i < port_receivers; i++) {
@@ -2276,6 +2287,15 @@ tcp_client::tcp_client(int id)
 		 */
 	}
 	sending_thread.emplace(&tcp_client::sender, this);
+}
+
+int tcp_client::choose_pooled_slot(int server)
+{
+	int slots_per_server = tcp_client_pooling ? tcp_pool_size : 1;
+	int slot = server * slots_per_server + next_pooled_slot[server];
+	next_pooled_slot[server] = (next_pooled_slot[server] + 1)
+			% slots_per_server;
+	return slot;
 }
 
 /**
@@ -2383,15 +2403,16 @@ void tcp_client::sender()
 		header.cid.client_port = id;
 		header.msg_id = slot;
 		header.freeze = freeze[header.cid.server];
-		size_t old_pending = connections[server]->pending();
+		int connection_slot = choose_pooled_slot(server);
+		size_t old_pending = connections[connection_slot]->pending();
 		tt("Sending TCP request, cid 0x%08x, id %u, length %d, pid %d",
 				header.cid, header.msg_id, header.length,
 				pid);
-		if ((!connections[server]->send_message(&header))
+		if ((!connections[connection_slot]->send_message(&header))
 				&& (old_pending == 0)) {
-			blocked.push_back(connections[server]);
-			if (connections[server]->pending() > max_pending) {
-				max_pending = connections[server]->pending();
+			blocked.push_back(connections[connection_slot]);
+			if (connections[connection_slot]->pending() > max_pending) {
+				max_pending = connections[connection_slot]->pending();
 				log(NORMAL, "max_pending now %lu for "
 						"tcp_client %d\n",
 						max_pending, id);
@@ -2662,6 +2683,8 @@ int client_cmd(std::vector<string> &words)
 	protocol = "homa";
 	server_nodes = 1;
 	tcp_fastopen = false;
+	tcp_client_pooling = false;
+	tcp_pool_size = 1;
 	tcp_trunc = true;
 	unloaded = 0;
 	workload = "100";
@@ -2708,13 +2731,13 @@ int client_cmd(std::vector<string> &words)
 				return 0;
 			i++;
 		} else if (strcmp(option, "--tcp-client-pooling") == 0) {
-			continue;
+			tcp_client_pooling = true;
 		} else if (strcmp(option, "--tcp-no-pooling") == 0) {
-			continue;
+			tcp_client_pooling = false;
 		} else if (strcmp(option, "--tcp-load-aware") == 0) {
 			continue;
 		} else if (strcmp(option, "--tcp-pool-size") == 0) {
-			if (!parse(words, i+1, &ignored_int, option, "integer"))
+			if (!parse(words, i+1, &tcp_pool_size, option, "integer"))
 				return 0;
 			i++;
 		} else if (strcmp(option, "--tcp-stagger-us") == 0) {
@@ -2768,6 +2791,10 @@ int client_cmd(std::vector<string> &words)
 		}
 	}
 	init_server_addrs();
+	if (tcp_pool_size < 1) {
+		printf("--tcp-pool-size must be at least 1\n");
+		return 0;
+	}
 	client_port_max = client_max/client_ports;
 	if (client_port_max < 1)
 		client_port_max = 1;
