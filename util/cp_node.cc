@@ -66,6 +66,8 @@ uint32_t client_port_max = 1;
 int client_ports = 0;
 int first_port = 4000;
 int first_server = 1;
+int client_nodes = 1;
+int client_rank = 0;
 bool is_server = false;
 int id = -1;
 double net_gbps = 0.0;
@@ -74,6 +76,7 @@ bool tcp_fastopen = false;
 bool tcp_client_pooling = false;
 int tcp_pool_size = 1;
 bool tcp_load_aware = false;
+int tcp_stagger_us = 0;
 bool tcp_multiplex = false;
 int tcp_multiplex_sessions = 1;
 int port_receivers = 1;
@@ -88,6 +91,14 @@ const char *workload = "100";
 int unloaded = 0;
 bool client_iovec = false;
 bool server_iovec = false;
+
+static uint64_t get_time_usec()
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return static_cast<uint64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+}
 
 /** @rand_gen: random number generator. */
 std::mt19937 rand_gen(
@@ -2500,6 +2511,10 @@ void tcp_client::sender()
 {
 	char thread_name[50];
 	int pid = syscall(__NR_gettid);
+	uint64_t cycles_per_us = get_cycles_per_sec()/1000000;
+	uint64_t scheduler_origin = 0;
+	uint64_t scheduler_slot = 0;
+	uint64_t scheduler_frame = 0;
 	
 	snprintf(thread_name, sizeof(thread_name), "C%d", id);
 	time_trace::thread_buffer thread_buffer(thread_name);
@@ -2507,6 +2522,31 @@ void tcp_client::sender()
 	uint64_t next_start = rdtsc();
 	message_header header;
 	size_t max_pending = 1;
+	if (tcp_stagger_us > 0) {
+		uint64_t lanes = static_cast<uint64_t>(client_nodes) * client_ports;
+		uint64_t lane = static_cast<uint64_t>(client_rank) * client_ports + id;
+		uint64_t frame_us = lanes * static_cast<uint64_t>(tcp_stagger_us);
+		uint64_t slot_us = lane * static_cast<uint64_t>(tcp_stagger_us);
+		uint64_t now_us = get_time_usec();
+		uint64_t phase_us = now_us % frame_us;
+		uint64_t wait_us = (phase_us <= slot_us)
+				? (slot_us - phase_us)
+				: (frame_us - phase_us + slot_us);
+		scheduler_slot = slot_us * cycles_per_us;
+		scheduler_frame = frame_us * cycles_per_us;
+		next_start += wait_us * cycles_per_us;
+		scheduler_origin = next_start - scheduler_slot;
+	}
+	auto align_to_schedule = [&](uint64_t target) {
+		if (scheduler_frame == 0)
+			return target;
+		uint64_t first_slot = scheduler_origin + scheduler_slot;
+		if (target <= first_slot)
+			return first_slot;
+		uint64_t delta = target - first_slot;
+		uint64_t rounds = (delta + scheduler_frame - 1)/scheduler_frame;
+		return first_slot + rounds*scheduler_frame;
+	};
 	
 	/* Index of the next connection in blocked on which to try sending. */
 	size_t next_blocked = 0;
@@ -2593,6 +2633,7 @@ void tcp_client::sender()
 			next_length = 0;
 		lag = now - next_start;
 		next_start += request_intervals[next_interval];
+		next_start = align_to_schedule(next_start);
 		next_interval++;
 		if (next_interval >= request_intervals.size())
 			next_interval = 0;
@@ -2831,9 +2872,10 @@ void log_stats()
  */
 int client_cmd(std::vector<string> &words)
 {
-	int ignored_int = 0;
 	client_iovec = false;
 	client_max = 1;
+	client_nodes = 1;
+	client_rank = 0;
 	client_ports = 1;
 	first_port = 4000;
 	first_server = 1;
@@ -2845,6 +2887,7 @@ int client_cmd(std::vector<string> &words)
 	tcp_client_pooling = false;
 	tcp_pool_size = 1;
 	tcp_load_aware = false;
+	tcp_stagger_us = 0;
 	tcp_multiplex = false;
 	tcp_multiplex_sessions = 1;
 	tcp_trunc = true;
@@ -2859,11 +2902,11 @@ int client_cmd(std::vector<string> &words)
 				return 0;
 			i++;
 		} else if (strcmp(option, "--client-nodes") == 0) {
-			if (!parse(words, i+1, &ignored_int, option, "integer"))
+			if (!parse(words, i+1, &client_nodes, option, "integer"))
 				return 0;
 			i++;
 		} else if (strcmp(option, "--client-rank") == 0) {
-			if (!parse(words, i+1, &ignored_int, option, "integer"))
+			if (!parse(words, i+1, &client_rank, option, "integer"))
 				return 0;
 			i++;
 		} else if (strcmp(option, "--first-port") == 0) {
@@ -2903,7 +2946,7 @@ int client_cmd(std::vector<string> &words)
 				return 0;
 			i++;
 		} else if (strcmp(option, "--tcp-stagger-us") == 0) {
-			if (!parse(words, i+1, &ignored_int, option, "integer"))
+			if (!parse(words, i+1, &tcp_stagger_us, option, "integer"))
 				return 0;
 			i++;
 		} else if (strcmp(option, "--no-trunc") == 0) {
