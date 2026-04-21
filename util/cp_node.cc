@@ -2628,6 +2628,7 @@ void log_stats()
  */
 int client_cmd(std::vector<string> &words)
 {
+	int ignored_int = 0;
 	client_iovec = false;
 	client_max = 1;
 	client_ports = 1;
@@ -2648,6 +2649,14 @@ int client_cmd(std::vector<string> &words)
 					option, "integer"))
 				return 0;
 			i++;
+		} else if (strcmp(option, "--client-nodes") == 0) {
+			if (!parse(words, i+1, &ignored_int, option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--client-rank") == 0) {
+			if (!parse(words, i+1, &ignored_int, option, "integer"))
+				return 0;
+			i++;
 		} else if (strcmp(option, "--first-port") == 0) {
 			if (!parse(words, i+1, &first_port, option, "integer"))
 				return 0;
@@ -2666,6 +2675,28 @@ int client_cmd(std::vector<string> &words)
 			i++;
 		} else if (strcmp(option, "--iovec") == 0) {
 			client_iovec = true;
+		} else if (strcmp(option, "--tcp-fastopen") == 0) {
+			continue;
+		} else if (strcmp(option, "--tcp-multiplex") == 0) {
+			continue;
+		} else if (strcmp(option, "--tcp-multiplex-sessions") == 0) {
+			if (!parse(words, i+1, &ignored_int, option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--tcp-client-pooling") == 0) {
+			continue;
+		} else if (strcmp(option, "--tcp-no-pooling") == 0) {
+			continue;
+		} else if (strcmp(option, "--tcp-load-aware") == 0) {
+			continue;
+		} else if (strcmp(option, "--tcp-pool-size") == 0) {
+			if (!parse(words, i+1, &ignored_int, option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--tcp-stagger-us") == 0) {
+			if (!parse(words, i+1, &ignored_int, option, "integer"))
+				return 0;
+			i++;
 		} else if (strcmp(option, "--no-trunc") == 0) {
 			tcp_trunc = false;
 		} else if (strcmp(option, "--ports") == 0) {
